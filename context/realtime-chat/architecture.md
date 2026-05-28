@@ -1,11 +1,11 @@
 # realtime-chat 아키텍처
 
 > 전체 구조 요약과 주제별 상세 문서 링크를 관리합니다.
-> 전제 스택: **Spring Boot + PostgreSQL**, 실시간 전송 **WebSocket/STOMP**, 비동기 파이프라인은 메시지 브로커(Kafka 또는 Redis Stream) 가정. 규모는 과제/POC 수준.
+> 확정 스택: **Spring Boot + PostgreSQL + Redis 단일**(Stream·Pub/Sub·presence), 실시간 전송 **WebSocket/STOMP**, 아키텍처 **이벤트 소싱 + CQRS**. 규모는 과제/POC 수준. 확장 시 Redis Stream → Kafka(파티션=세션 샤딩).
 
 ## 시스템 구조
 
-(확정 시 상세화)
+> 설계 확정됨. 컴포넌트·데이터 흐름·결정별 이유의 상세는 [설계서 §2](../../docs/design/2026-05-28-realtime-chat-design.md)를 참조.
 
 핵심 흐름은 **이벤트 수집 → 저장(이벤트 소싱) → 프로젝션/스냅샷 → 시점 복원** 이다.
 
