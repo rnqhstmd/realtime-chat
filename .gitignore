@@ -1,9 +1,6 @@
 # OMC tooling state
 .omc/
 
-# gx-dev pipeline artifacts
-.dev/
-
 # Gradle / Spring Boot build artifacts
 .gradle/
 build/
