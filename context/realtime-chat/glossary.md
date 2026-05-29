@@ -21,3 +21,8 @@
 | Fan-out | 이벤트를 Redis Pub/Sub으로 전 인스턴스에 전파해 어느 노드에 붙은 참여자에게도 전달하는 것 |
 | Projection lag | 이벤트 발생 시각과 읽기모델 반영 시각의 차이. 비동기 파이프라인 건강의 핵심 SLI |
 | resume | 재연결 시 클라이언트의 마지막 `seq` 이후 이벤트만 재생해 정합성을 맞추는 것 |
+| Redis Stream | 이벤트를 발행/소비하는 append-only 로그 자료구조. Phase 2에서 outbox→projection worker 사이의 비동기 전달 채널(`events` 스트림)로 사용 |
+| Relay (Outbox Relay) | 미발행(`published=false`) outbox 레코드를 주기적으로 폴링해 Redis Stream에 XADD 발행하고 `published=true`로 표시하는 컴포넌트. event store 권위라 at-least-once(유실<중복) |
+| Consumer Group | Redis Stream의 소비자 그룹(`proj`). 메시지를 그룹 내 소비자에게 한 번씩 분배하고 미ACK 메시지를 PEL(pending)로 추적. projection worker가 XREADGROUP으로 소비 |
+| DLQ (Dead Letter Queue) | 재시도 한도(기본 3회)를 초과한 독성 메시지를 격리하는 별도 스트림(`events:dlq`). 본 파이프라인 정체를 막고, event store가 원천이라 수동 재처리 가능 |
+| gap-fill | projection worker가 수신 seq가 `last_applied_seq+1`보다 큰 gap을 감지하면, event store(`findBySeqRange`)에서 누락 구간을 직접 조회해 순서대로 보강 적용하는 것. 순서·완전성의 권위는 스트림이 아닌 event store |

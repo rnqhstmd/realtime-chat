@@ -1,5 +1,5 @@
 phase: complete
-status: in_progress
+status: completed
 vcs-type: git
 branch: feat/realtime-chat-phase2
 base: main
@@ -13,7 +13,7 @@ intent-source: user-selection
 tech-stack: "Java 17, Spring Boot 3.3.5, Gradle KTS, JdbcTemplate+Flyway (Phase2: +spring-data-redis/Lettuce, Redis Stream, Awaitility/testcontainers-redis)"
 package-base: com.realtimechat
 started: 2026-05-29
-current-step: "complete (인수 검증 → commit → PR)"
+current-step: "완료 — PR #3 생성(https://github.com/rnqhstmd/realtime-chat/pull/3). 머지는 리뷰어 수행."
 decisions:
   - "Q1 전환전략 = 완전 비동기 (동기 projection 제거, CommandHandler는 append+outbox+broadcast만, 테스트 Awaitility 대기)"
   - "Q2 Outbox Relay = 폴링(500ms, published=false 부분인덱스)"
@@ -36,6 +36,7 @@ phases:
   design: completed
   implement: completed
   review: completed
+  complete: completed
   complete: pending
 artifacts:
   - "prd.md (확정)"

@@ -31,7 +31,7 @@
 | FR-12 | 재연결 시 데이터 정합성 유지 방식 | ⬜ | |
 | FR-13 | 수평 확장 시 세션 분산·상태 저장 전략 | ⬜ | |
 | FR-14 | 관측 가능성 설계(로그/메트릭/추적) | ⬜ | |
-| FR-15 | 비동기 처리 구조(Projection/Snapshot/재시도/DLQ/Idempotency) | ⬜ | |
+| FR-15 | 비동기 처리 구조(Projection/Snapshot/재시도/DLQ/Idempotency) | ✅ | [#3](https://github.com/rnqhstmd/realtime-chat/pull/3) |
 | FR-16 | 장애 대응 시나리오(서버다운/DB장애/데이터유실) | ⬜ | |
 
 ## 4.3 이벤트 기반 상태 복원
@@ -47,15 +47,15 @@
 | ID | 요구사항 | 상태 | PR/커밋 |
 |----|----------|------|---------|
 | FR-20 | 핫패스 주요 쿼리 2~3개(SQL/인덱스/병목 분석) | ⬜ | |
-| FR-21 | 비동기 처리 설계(재시도/DLQ/Idempotency) | ⬜ | |
+| FR-21 | 비동기 처리 설계(재시도/DLQ/Idempotency) | ✅ | [#3](https://github.com/rnqhstmd/realtime-chat/pull/3) |
 | FR-22 | 장애 대응 시나리오(운영 관점, 감지→완화→복구) | ⬜ | |
 
 ## 5. 가산점 항목
 
 | ID | 항목 | 상태 | PR/커밋 |
 |----|------|------|---------|
-| BONUS-1 | Snapshot 생성 자동화 | ⬜ | |
-| BONUS-2 | Projection 비동기 파이프라인 구성 | ⬜ | |
+| BONUS-1 | Snapshot 생성 자동화 | ✅ | [#3](https://github.com/rnqhstmd/realtime-chat/pull/3) |
+| BONUS-2 | Projection 비동기 파이프라인 구성 | ✅ | [#3](https://github.com/rnqhstmd/realtime-chat/pull/3) |
 | BONUS-3 | 부하 테스트 및 성능 측정 결과 | ⬜ | |
 | BONUS-4 | 운영 대시보드 또는 메트릭 시각화 | ⬜ | |
 | BONUS-5 | WebRTC 등 추가 통신 방식 비교/구현 | ⬜ | |

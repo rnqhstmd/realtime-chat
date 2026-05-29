@@ -1,5 +1,5 @@
  .dev/feat-realtime-chat-phase2/codemap.md          |  10 +
- .dev/feat-realtime-chat-phase2/diff.txt            |  34 +++
+ .dev/feat-realtime-chat-phase2/diff.txt            |  38 +++
  .dev/feat-realtime-chat-phase2/self-check.md       |  17 ++
  .dev/feat-realtime-chat-phase2/state.md            |   9 +-
  .dev/feat-realtime-chat-phase2/trust-ledger.md     |  38 +++
@@ -33,6 +33,6 @@
  .../support/AbstractIntegrationTest.java           |  17 +-
  .../com/realtimechat/support/AwaitProjection.java  |  27 ++
  src/test/resources/application-test.yml            |  15 +
- 35 files changed, 2039 insertions(+), 64 deletions(-)
+ 35 files changed, 2043 insertions(+), 64 deletions(-)
 ---
 위는 변경 요약입니다. 변경된 파일을 Read 도구로 직접 확인하라.
