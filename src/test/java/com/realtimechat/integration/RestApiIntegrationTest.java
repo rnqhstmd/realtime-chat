@@ -1,5 +1,6 @@
 package com.realtimechat.integration;
 
+import static com.realtimechat.support.AwaitProjection.awaitProjection;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.realtimechat.event.EventType;
@@ -235,13 +236,16 @@ class RestApiIntegrationTest extends AbstractIntegrationTest {
                 new HttpEntity<>(null), Void.class);
         assertThat(endResp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
-        @SuppressWarnings("unchecked")
-        ResponseEntity<List<Map<String, Object>>> listResp = rest.exchange(
-                "/sessions?status=ENDED", HttpMethod.GET, new HttpEntity<>(null),
-                (Class<List<Map<String, Object>>>) (Class<?>) List.class);
-        assertThat(listResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        boolean found = listResp.getBody().stream()
-                .anyMatch(m -> sessionId.toString().equals(m.get("sessionId")));
-        assertThat(found).isTrue();
+        // 비동기 projection 반영 대기: session_view status=ENDED 반영 후 목록 조회
+        awaitProjection(() -> {
+            @SuppressWarnings("unchecked")
+            ResponseEntity<List<Map<String, Object>>> listResp = rest.exchange(
+                    "/sessions?status=ENDED", HttpMethod.GET, new HttpEntity<>(null),
+                    (Class<List<Map<String, Object>>>) (Class<?>) List.class);
+            assertThat(listResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+            boolean found = listResp.getBody().stream()
+                    .anyMatch(m -> sessionId.toString().equals(m.get("sessionId")));
+            assertThat(found).isTrue();
+        });
     }
 }

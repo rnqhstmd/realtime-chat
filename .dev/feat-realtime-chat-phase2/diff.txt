@@ -1,0 +1,38 @@
+ .dev/feat-realtime-chat-phase2/codemap.md          |  10 +
+ .dev/feat-realtime-chat-phase2/diff.txt            |  34 +++
+ .dev/feat-realtime-chat-phase2/self-check.md       |  17 ++
+ .dev/feat-realtime-chat-phase2/state.md            |   9 +-
+ .dev/feat-realtime-chat-phase2/trust-ledger.md     |  38 +++
+ build.gradle.kts                                   |   3 +
+ gradlew                                            |   0
+ .../com/realtimechat/RealtimeChatApplication.java  |   4 +
+ .../com/realtimechat/async/EventStreamCodec.java   |  69 +++++
+ .../java/com/realtimechat/async/RedisConfig.java   |  21 ++
+ .../realtimechat/async/RedisStreamInitializer.java |  68 +++++
+ .../com/realtimechat/async/StreamConstants.java    |  22 ++
+ .../java/com/realtimechat/async/StreamProps.java   |  36 +++
+ .../com/realtimechat/command/CommandHandler.java   |  25 +-
+ .../java/com/realtimechat/event/EventStore.java    |   8 +-
+ .../java/com/realtimechat/outbox/OutboxDao.java    | 116 +++++++
+ .../java/com/realtimechat/outbox/OutboxRecord.java |  36 +++
+ .../java/com/realtimechat/outbox/OutboxRelay.java  | 110 +++++++
+ .../projection/ParticipantViewDao.java             |  19 ++
+ .../realtimechat/projection/SessionViewDao.java    |  16 +-
+ .../projection/async/ProjectionApplier.java        | 159 ++++++++++
+ .../projection/async/ProjectionLagMetrics.java     |  38 +++
+ .../projection/async/ProjectionOffsetDao.java      |  99 ++++++
+ .../projection/async/ProjectionWorker.java         | 320 ++++++++++++++++++++
+ .../com/realtimechat/restore/SnapshotService.java  |  22 +-
+ src/main/resources/application.yml                 |  24 ++
+ .../resources/db/migration/V2__async_pipeline.sql  |  29 ++
+ .../integration/AsyncPipelineIntegrationTest.java  | 334 +++++++++++++++++++++
+ .../integration/EventSourcingIntegrationTest.java  |  91 +++---
+ .../integration/GapFillIntegrationTest.java        | 155 ++++++++++
+ .../integration/RestApiIntegrationTest.java        |  20 +-
+ .../integration/SyncProjectionIntegrationTest.java |  92 ++++++
+ .../support/AbstractIntegrationTest.java           |  17 +-
+ .../com/realtimechat/support/AwaitProjection.java  |  27 ++
+ src/test/resources/application-test.yml            |  15 +
+ 35 files changed, 2039 insertions(+), 64 deletions(-)
+---
+위는 변경 요약입니다. 변경된 파일을 Read 도구로 직접 확인하라.

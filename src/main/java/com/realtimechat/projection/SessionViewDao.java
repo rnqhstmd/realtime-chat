@@ -40,13 +40,17 @@ public class SessionViewDao {
     private static final String INCREMENT_MESSAGES_SQL =
             "UPDATE session_view SET message_count = message_count + 1 WHERE session_id = :sid";
 
-    // :at이 NULL이면 last_activity_at을 덮어쓰지 않도록 방어(가드). 현 호출부는 비-null을 넘기지만,
-    // NULL 전달 시 기존 활동시각을 NULL로 지우는 사고를 막는다.
-    // WHERE 절의 :at은 CAST(... AS timestamptz)로 타입을 명시해야 PostgreSQL이 NULL 파라미터의
-    // 데이터 타입을 추론할 수 있다('? IS NOT NULL' 단독은 untyped → 42P18 오류).
+    // 단조(monotonic) 가드: gap-fill / XAUTOCLAIM 재청구로 과거 seq 이벤트가 재적용되더라도
+    // last_activity_at이 과거로 회귀하지 않도록 한다. 동기 순방향 경로에서는 :at이 항상 더 최신이므로
+    // 이 가드의 영향은 없다. :at NULL 방어(CAST IS NOT NULL)도 유지한다.
+    // CAST(:at AS timestamptz) IS NOT NULL: PostgreSQL이 NULL 파라미터 타입을 추론하지 못해 발생하는
+    // 42P18 오류를 피하기 위해 명시적 캐스트가 필요하다.
     private static final String TOUCH_ACTIVITY_SQL =
-            "UPDATE session_view SET last_activity_at = :at "
-                    + "WHERE session_id = :sid AND CAST(:at AS timestamptz) IS NOT NULL";
+            "UPDATE session_view"
+                    + "   SET last_activity_at = :at"
+                    + " WHERE session_id = :sid"
+                    + "   AND CAST(:at AS timestamptz) IS NOT NULL"
+                    + "   AND (last_activity_at IS NULL OR :at > last_activity_at)";
 
     private static final String MARK_ENDED_SQL =
             "UPDATE session_view SET status = 'ENDED', ended_at = :endedAt WHERE session_id = :sid";

@@ -1,4 +1,4 @@
-phase: implement
+phase: complete
 status: in_progress
 vcs-type: git
 branch: feat/realtime-chat-phase2
@@ -13,7 +13,7 @@ intent-source: user-selection
 tech-stack: "Java 17, Spring Boot 3.3.5, Gradle KTS, JdbcTemplate+Flyway (Phase2: +spring-data-redis/Lettuce, Redis Stream, Awaitility/testcontainers-redis)"
 package-base: com.realtimechat
 started: 2026-05-29
-current-step: "RESUME 지점 — 설계 승인·저장 완료, implement 미착수. design.md '구현 순서' 1번부터 시작할 것 (집에서 이어서 작업)."
+current-step: "complete (인수 검증 → commit → PR)"
 decisions:
   - "Q1 전환전략 = 완전 비동기 (동기 projection 제거, CommandHandler는 append+outbox+broadcast만, 테스트 Awaitility 대기)"
   - "Q2 Outbox Relay = 폴링(500ms, published=false 부분인덱스)"
@@ -23,6 +23,7 @@ decisions:
   - "[design] 스냅샷 트리거 = afterCommit 별도 TX (리셋은 apply TX)"
   - "[design] Redis Testcontainer = RedisContainer + @ServiceConnection"
   - "[design] 다중 인스턴스 = POC 단일 인스턴스 전제 + consumer 이름 호스트명 유일"
+  - "[implement/사용자결정] 스냅샷 up_to_seq = Worker 적용 seq 기준. SnapshotService.createSnapshot(sessionId,upToSeq) 오버로드 신규 추가(설계 선언 9파일 외 추가 수정). ProjectionApplier가 incoming.seq() 전달. 근거: AC-9 결정적 통과(up_to_seq 5/10/15 정렬) + replay 상한 명확."
 critic-fixes-in-design:
   - "①카운터 멱등 권위 = per-row 전이 boolean 유지(projection_offset은 gap감지+스냅샷카운팅 전용, 카운터 가드 아님)"
   - "②touchActivity 시각 단조 가드 추가"
@@ -33,8 +34,8 @@ phases:
   setup: completed
   requirements: completed
   design: completed
-  implement: pending
-  review: pending
+  implement: completed
+  review: completed
   complete: pending
 artifacts:
   - "prd.md (확정)"

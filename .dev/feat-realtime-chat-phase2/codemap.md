@@ -26,6 +26,16 @@
 - `src/test/resources/application-test.yml` → 테스트 프로파일.
 - `.claude/config.json` → java-spring 빌드 `./gradlew build`. 타임아웃 5분.
 
+### Phase 2 구현 발견 사항 (B1)
+- **StoredEvent 실제 시그니처**: `record StoredEvent(UUID eventId, UUID sessionId, long seq, EventType type, JsonNode payload, String idempotencyKey, UUID actorId, Instant occurredAt)`. 설계서의 `eventType`은 실제 `type`, payload는 `JsonNode`(String 아님). Codec/OutboxRecord/OutboxDao/EventStore는 이 시그니처 기준.
+- **JsonUtil은 static util**(빈 아님): `JsonUtil.toJson(...)`, `JsonUtil.readTree(...)` 직접 호출. 생성자 주입 불요.
+- **EventStreamCodec**: `@Component`, payload JsonNode↔JSON string, actorId null↔빈문자열, occurredAt Instant↔epoch-milli.
+- **StreamProps**: `@ConfigurationProperties("chat.redis")` record + compact constructor 기본값. @ConfigurationPropertiesScan은 13단계에서 활성화.
+- **[설계 deviation] Redis Testcontainer 의존성**: 설계서가 지정한 `org.testcontainers:redis`는 Spring Boot 3.3.5 testcontainers BOM에 미존재(버전 미관리, 해소 실패). → `com.redis:testcontainers-redis:2.2.2`로 교체. 14단계 AbstractIntegrationTest는 `com.redis.testcontainers.RedisContainer` 사용(GenericContainer 상속, image "redis" → Spring Boot `RedisContainerConnectionDetailsFactory`가 `@ServiceConnection` 자동 지원).
+
+### Phase 2 버그 수정 (B6 테스트 검증)
+- **RedisStreamInitializer BUSYGROUP 미처리 버그**: `e.getMessage().contains("BUSYGROUP")`가 최상위 RedisSystemException 메시지만 검사 → 실제 "BUSYGROUP"은 cause(Lettuce RedisBusyException)에 있어 매칭 실패 → 두 번째 컨텍스트부터 그룹 재생성 시 예외 재throw → ApplicationContext 로드 실패(34/54 테스트 실패). 증상: 첫 컨텍스트(AsyncPipelineIntegrationTest)는 그룹 신규 생성으로 통과, 이후 모든 distinct 컨텍스트(EventSourcing/RestApi/WebSocketStomp/SyncProjection)가 공유 Redis에서 BUSYGROUP. → `isBusyGroup(Throwable)` cause 체인 순회 판정으로 수정.
+
 ### 컨벤션
 - 순수 Java(Lombok 미사용), 생성자 주입, record DTO, UUID/Instant, NamedParameterJdbcTemplate, JsonUtil 직렬화. 호출자 트랜잭션 가정(@Transactional은 CommandHandler 경계).
 

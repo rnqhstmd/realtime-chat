@@ -3,6 +3,7 @@ package com.realtimechat.event;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.realtimechat.common.error.InvalidEventException;
 import com.realtimechat.common.json.JsonUtil;
+import com.realtimechat.outbox.OutboxDao;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
@@ -64,10 +65,12 @@ public class EventStore {
             "SELECT COALESCE(max(seq), 0) FROM event WHERE session_id = :sid";
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final OutboxDao outboxDao;
     private final RowMapper<StoredEvent> rowMapper = new StoredEventRowMapper();
 
-    public EventStore(NamedParameterJdbcTemplate jdbc) {
+    public EventStore(NamedParameterJdbcTemplate jdbc, OutboxDao outboxDao) {
         this.jdbc = jdbc;
+        this.outboxDao = outboxDao;
     }
 
     /**
@@ -130,6 +133,9 @@ public class EventStore {
                     cmd.idempotencyKey(),
                     cmd.actorId(),
                     occurredAt.get(0));
+            // FR-P2-1, BR-1: 신규 이벤트 1건에 대해 같은 트랜잭션 안에서 outbox 1건 INSERT.
+            // 멱등 재유입(isNew=false) 경로에서는 호출하지 않는다.
+            outboxDao.insert(stored);
             return new AppendResult(stored, true);
         }
 

@@ -12,6 +12,10 @@ spring:
     locations: classpath:db/migration
   jackson:
     default-property-inclusion: non_null
+  data:
+    redis:
+      host: localhost
+      port: 6379
 
 server:
   port: 8080
@@ -20,3 +24,23 @@ logging:
   level:
     root: INFO
     com.realtimechat: DEBUG
+
+chat:
+  outbox:
+    relay:
+      poll-interval-ms: 500
+      batch-size: 100
+  projection:
+    sync-enabled: false
+  snapshot:
+    trigger-interval: 200
+  redis:
+    stream: events
+    group: proj
+    dlq-stream: events:dlq
+    consumer: ${HOSTNAME:worker-1}
+    max-attempts: 3
+    claim-min-idle-ms: 30000
+    read-block-ms: 2000
+    read-count: 50
+    stream-maxlen: 100000
