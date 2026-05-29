@@ -16,3 +16,8 @@
 | at (복원 시점) | `GET /sessions/{id}/timeline?at=...` 의 기준 시각/시퀀스 |
 | unread count | (선택) 참여자별 안 읽은 메시지 수. 복원 시 부가 상태 |
 | typing indicator | (선택) 입력 중 표시 상태. 복원 시 부가 상태 |
+| Transactional Outbox | 이벤트 DB 저장과 브로커 발행의 이중쓰기를 피하려 같은 트랜잭션에 event+outbox를 쓰고 커밋 후 발행하는 패턴 |
+| seq-guard | projection worker가 `last_applied_seq`로 중복/순서 어긋난 재전달을 걸러 멱등 적용하는 가드 |
+| Fan-out | 이벤트를 Redis Pub/Sub으로 전 인스턴스에 전파해 어느 노드에 붙은 참여자에게도 전달하는 것 |
+| Projection lag | 이벤트 발생 시각과 읽기모델 반영 시각의 차이. 비동기 파이프라인 건강의 핵심 SLI |
+| resume | 재연결 시 클라이언트의 마지막 `seq` 이후 이벤트만 재생해 정합성을 맞추는 것 |

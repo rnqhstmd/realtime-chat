@@ -1,6 +1,7 @@
 # realtime-chat 구현 추적
 
 > 과제 요구사항(`requirements/과제요구사항.md`)별 구현/문서 상태를 추적합니다.
+> **설계 완료** (이벤트 소싱 + CQRS): [설계서](../../docs/design/2026-05-28-realtime-chat-design.md). 구현은 설계서 §13 Phase 1~4 순서로 진행. 아래 항목은 전부 구현 미착수(⬜).
 
 ## 범례
 
