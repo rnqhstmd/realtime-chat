@@ -1,2 +1,16 @@
 # OMC tooling state
 .omc/
+
+# gx-dev pipeline artifacts
+.dev/
+
+# Gradle / Spring Boot build artifacts
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store

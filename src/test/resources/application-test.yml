@@ -1,0 +1,12 @@
+spring:
+  # datasource는 Testcontainers @ServiceConnection이 동적으로 주입한다(고정 url 미지정).
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jackson:
+    default-property-inclusion: non_null
+
+logging:
+  level:
+    root: INFO
+    com.realtimechat: DEBUG

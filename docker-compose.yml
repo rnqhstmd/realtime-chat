@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: realtime-chat-postgres
+    environment:
+      POSTGRES_DB: realtimechat
+      POSTGRES_USER: realtimechat
+      POSTGRES_PASSWORD: realtimechat
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U realtimechat -d realtimechat"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Redis는 Phase 2+ (Outbox→Stream→projection, Pub/Sub 팬아웃, presence TTL)에서 사용.
+  # Phase 1에서는 사용하지 않으며, 인프라 자리를 미리 확보하는 용도로만 정의한다.
+  redis:
+    image: redis:7
+    container_name: realtime-chat-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  postgres-data:
+  redis-data:
