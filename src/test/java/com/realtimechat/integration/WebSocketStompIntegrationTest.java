@@ -109,6 +109,12 @@ class WebSocketStompIntegrationTest extends AbstractIntegrationTest {
         }
     }
 
+    // 주: [4] WS 에러 핸들러(@MessageExceptionHandler + @SendToUser("/queue/errors"))의 통합 테스트는
+    // 생략한다. 인증 없는(Phase 1, anonymous) STOMP 세션에서 user-destination(/user/queue/errors)
+    // 라우팅·구독 매칭이 클라이언트 세션 식별/구독 타이밍에 의존해 환경적으로 불안정하기 때문이다.
+    // 핸들러 빈 배선과 매핑은 메인 코드 컴파일 + 컨텍스트 로드로 검증되며, 결함 수정 자체(예외 전달
+    // 경로 추가)는 메인 코드에 반영되어 있다(설계 지시: WS 에러 핸들러 테스트는 복잡하면 생략 가능).
+
     /**
      * 컨테이너 DB에 세션 행을 만든다. inbound 수집(CommandHandler)이 세션 상태를 검증하므로
      * 사전에 ACTIVE 세션이 존재해야 한다. {@link SessionService}로 직접 생성한다.

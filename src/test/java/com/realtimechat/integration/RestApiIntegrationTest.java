@@ -174,6 +174,17 @@ class RestApiIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
+    @DisplayName("GET /timeline?at=<Long초과 숫자> → 400 (seq out of range)")
+    void timelineSeqOverflowReturns400() {
+        UUID sessionId = createSession();
+
+        // 20자리 숫자: Long.MAX_VALUE(19자리) 초과 → NumberFormatException → 400(catch-all 500 아님)
+        ResponseEntity<Map> resp = rest.getForEntity(
+                "/sessions/" + sessionId + "/timeline?at=99999999999999999999", Map.class);
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
     @DisplayName("GET /messages?limit=0 / limit=501 → 400 (limit 범위 밖)")
     void messagesLimitOutOfRangeReturns400() {
         UUID sessionId = createSession();

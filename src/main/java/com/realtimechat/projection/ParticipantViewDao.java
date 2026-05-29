@@ -32,9 +32,13 @@ public class ParticipantViewDao {
                     + "(session_id, participant_id, status, presence, joined_seq, left_seq, last_applied_seq) "
                     + "VALUES (:sid, :pid, 'JOINED', 'ONLINE', :seq, NULL, :seq)";
 
-    /** 기존 행을 JOINED로 갱신(재가입 포함). left_seq는 NULL로 되돌린다. */
+    /**
+     * 기존 행을 JOINED로 갱신(재가입 포함). left_seq는 NULL로 되돌리고 joined_seq는 새 seq로 갱신한다.
+     * LEFT→JOINED 재가입 시 joined_seq를 새 seq로 옮겨, 복원 모델({@code Fold.applyParticipantJoined}가
+     * joinedSeq=event.seq()로 설정)과 동기 projection의 joined_seq를 일치시킨다.
+     */
     private static final String UPDATE_JOINED_SQL =
-            "UPDATE participant_view SET status = 'JOINED', last_applied_seq = :seq, left_seq = NULL "
+            "UPDATE participant_view SET status = 'JOINED', joined_seq = :seq, last_applied_seq = :seq, left_seq = NULL "
                     + "WHERE session_id = :sid AND participant_id = :pid";
 
     private static final String UPDATE_LEFT_SQL =

@@ -28,6 +28,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
  * 이벤트 소싱 end-to-end 통합 테스트(Testcontainers PostgreSQL, 설계서 §12).
@@ -45,6 +46,7 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
     @Autowired private SnapshotService snapshotService;
     @Autowired private SnapshotDao snapshotDao;
     @Autowired private MessageViewDao messageViewDao;
+    @Autowired private JdbcTemplate jdbcTemplate;
 
     // ---- payload → JsonNode 헬퍼 ----
 
@@ -417,6 +419,55 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
         assertThatThrownBy(() -> commandHandler.handle(sessionId, EventType.PRESENCE_CHANGED,
                 node(new PresenceChangedPayload(participant, "BOGUS")), "pres-bad", participant))
                 .isInstanceOf(InvalidEventException.class);
+    }
+
+    // =====================================================================
+    // 회귀: 재가입 시 participant_view.joined_seq가 새 seq로 갱신되고 복원 모델과 일치
+    // =====================================================================
+    @Test
+    @DisplayName("회귀: join→leave→rejoin 후 participant_view.joined_seq=재참여 seq, 복원 joinedSeq와 일치")
+    void regression_rejoinUpdatesJoinedSeq() {
+        UUID sessionId = sessionService.createSession();
+        UUID alice = UUID.randomUUID();
+
+        StoredEvent firstJoin = sessionService.join(sessionId, alice, "j-a-1");    // seq 1
+        leave(sessionId, alice, "l-a-1");                                          // seq 2
+        StoredEvent rejoin = sessionService.join(sessionId, alice, "j-a-2");       // seq 3
+
+        // 동기 projection: participant_view.joined_seq가 재참여 seq(3)로 갱신됨(이전 join seq 1 아님)
+        Long projectionJoinedSeq = jdbcTemplate.queryForObject(
+                "SELECT joined_seq FROM participant_view WHERE session_id = ? AND participant_id = ?",
+                Long.class, sessionId, alice);
+        assertThat(projectionJoinedSeq).isEqualTo(rejoin.seq());
+        assertThat(projectionJoinedSeq).isNotEqualTo(firstJoin.seq());
+
+        // 복원 모델(event replay)의 joinedSeq도 재참여 seq → 동기 projection과 일치
+        SessionState restored = restoreService.restoreTo(sessionId, rejoin.seq());
+        assertThat(restored.participant(alice).status()).isEqualTo("JOINED");
+        assertThat(restored.participant(alice).joinedSeq()).isEqualTo(rejoin.seq());
+        assertThat(restored.participant(alice).joinedSeq()).isEqualTo(projectionJoinedSeq);
+    }
+
+    // =====================================================================
+    // 회귀: ENDED 세션에는 이벤트 수집 불가(InvalidEventException → 400)
+    // =====================================================================
+    @Test
+    @DisplayName("회귀: 세션 end 후 같은 세션에 이벤트 수집 시 거부(InvalidEventException)")
+    void regression_endedSessionRejectsEvents() {
+        UUID sessionId = sessionService.createSession();
+        UUID alice = UUID.randomUUID();
+        sessionService.join(sessionId, alice, "j-a");
+
+        sessionService.end(sessionId);
+        assertThat(sessionService.get(sessionId).orElseThrow().status()).isEqualTo("ENDED");
+
+        // ENDED 세션에 신규 이벤트 수집 → CommandHandler status() 가드 + EventStore 채번 가드 모두 차단
+        assertThatThrownBy(() -> commandHandler.handle(sessionId, EventType.MESSAGE_SENT,
+                node(new MessageSentPayload(UUID.randomUUID(), alice, "after-end")), "after-end-1", alice))
+                .isInstanceOf(InvalidEventException.class);
+
+        // 거부되어 이벤트가 추가되지 않음(join seq 1만 존재)
+        assertThat(eventStore.maxSeq(sessionId)).isEqualTo(1L);
     }
 
     // ---- 회귀 테스트 헬퍼 ----

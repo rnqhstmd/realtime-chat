@@ -2,10 +2,16 @@ package com.realtimechat.realtime;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.realtimechat.command.CommandHandler;
+import com.realtimechat.common.error.InvalidEventException;
+import com.realtimechat.common.error.SessionNotFoundException;
 import com.realtimechat.event.EventType;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.messaging.handler.annotation.DestinationVariable;
+import org.springframework.messaging.handler.annotation.MessageExceptionHandler;
 import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.messaging.simp.annotation.SendToUser;
 import org.springframework.stereotype.Controller;
 
 /**
@@ -22,6 +28,8 @@ import org.springframework.stereotype.Controller;
 @Controller
 public class StompEventController {
 
+    private static final Logger log = LoggerFactory.getLogger(StompEventController.class);
+
     private final CommandHandler commandHandler;
 
     public StompEventController(CommandHandler commandHandler) {
@@ -37,6 +45,32 @@ public class StompEventController {
     @MessageMapping("/session/{sessionId}/events")
     public void collect(@DestinationVariable UUID sessionId, WsEventMessage msg) {
         commandHandler.handle(sessionId, msg.type(), msg.payload(), msg.idempotencyKey(), msg.actorId());
+    }
+
+    /**
+     * STOMP inbound 처리 중 발생한 검증/세션 예외를 클라이언트에게 전달한다(설계서 §6).
+     *
+     * <p>{@code @RestControllerAdvice}(ApiExceptionHandler)는 STOMP {@code @MessageMapping} 예외를
+     * 잡지 못한다. 이 핸들러가 {@link InvalidEventException}/{@link SessionNotFoundException}을
+     * {@code /user/queue/errors}로 보내, 잘못된 입력이 조용히 무시되지 않게 한다. 메시지 본문은
+     * 그대로 노출해도 사용자 입력 결함을 알리는 용도이므로 안전하다.
+     */
+    @MessageExceptionHandler({InvalidEventException.class, SessionNotFoundException.class})
+    @SendToUser("/queue/errors")
+    public StompError handleClientError(RuntimeException e) {
+        String code = e instanceof SessionNotFoundException ? "SESSION_NOT_FOUND" : "INVALID_EVENT";
+        return new StompError(code, e.getMessage());
+    }
+
+    /**
+     * 기타 예외 처리(설계서 §6). 내부 상세(예외 클래스/스택)는 노출하지 않고 고정 메시지만 보낸다.
+     * 원문은 서버 로그로만 남긴다.
+     */
+    @MessageExceptionHandler(Exception.class)
+    @SendToUser("/queue/errors")
+    public StompError handleUnexpected(Exception e) {
+        log.error("Unhandled STOMP inbound exception", e);
+        return new StompError("ERROR", "Failed to process message");
     }
 
     /**

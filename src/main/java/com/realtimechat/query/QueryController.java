@@ -116,7 +116,13 @@ public class QueryController {
         }
         String trimmed = at.trim();
         if (isSeq(trimmed)) {
-            return restoreService.restoreTo(id, Long.parseLong(trimmed));
+            // seq 경로: 20자리+ 숫자 등 Long 범위 초과 시 NumberFormatException을
+            // 400으로 매핑한다(ISO-8601 파싱 실패가 400인 것과 대칭). catch-all 500을 방지.
+            try {
+                return restoreService.restoreTo(id, Long.parseLong(trimmed));
+            } catch (NumberFormatException e) {
+                throw new InvalidEventException("Invalid 'at': seq out of range: " + at, e);
+            }
         }
         try {
             return restoreService.restoreAt(id, Instant.parse(trimmed));
