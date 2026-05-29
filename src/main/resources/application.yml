@@ -1,0 +1,22 @@
+spring:
+  application:
+    name: realtime-chat
+  datasource:
+    url: jdbc:postgresql://localhost:5432/realtimechat
+    # 로컬 docker-compose 전용; 운영은 SPRING_DATASOURCE_PASSWORD 등 환경변수/Vault 주입.
+    username: realtimechat
+    password: realtimechat
+    driver-class-name: org.postgresql.Driver
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jackson:
+    default-property-inclusion: non_null
+
+server:
+  port: 8080
+
+logging:
+  level:
+    root: INFO
+    com.realtimechat: DEBUG
