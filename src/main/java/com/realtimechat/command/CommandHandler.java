@@ -14,7 +14,11 @@ import com.realtimechat.event.StoredEvent;
 import com.realtimechat.projection.ProjectionUpdater;
 import com.realtimechat.realtime.SessionBroadcaster;
 import com.realtimechat.session.SessionDao;
+import jakarta.annotation.PostConstruct;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -32,13 +36,16 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  *   <li>멱등 키·세션 상태 검증(§4.1, §11),</li>
  *   <li>타입별 payload 검증·보강(§3.1: 검증은 append 전 커맨드 경계에서 완료),</li>
  *   <li>{@link EventStore#append}로 seq 채번 + 수집 멱등(§4.1 계층1),</li>
- *   <li>{@link ProjectionUpdater#apply}로 동기 projection(§13 Phase 1),</li>
+ *   <li>{@link ProjectionUpdater#apply}로 동기 projection — {@code chat.projection.sync-enabled=true}일 때만
+ *       실행(기본 {@code false}, 테스트/디버깅 전용). 운영의 read model 갱신은 비동기 ProjectionWorker 경로가 유일함,</li>
  *   <li>커밋 직후 {@link SessionBroadcaster}로 실시간 팬아웃(§6)</li>
  * </ol>
  * 을 수행한다. 전송(broadcast)은 진실의 원천을 오염시키지 않도록 <b>afterCommit</b>에서만 일어난다.
  */
 @Service
 public class CommandHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(CommandHandler.class);
 
     private static final String STATUS_ENDED = "ENDED";
 
@@ -50,15 +57,25 @@ public class CommandHandler {
     private final ProjectionUpdater projectionUpdater;
     private final SessionDao sessionDao;
     private final SessionBroadcaster broadcaster;
+    private final boolean syncProjectionEnabled;
 
     public CommandHandler(EventStore eventStore,
                           ProjectionUpdater projectionUpdater,
                           SessionDao sessionDao,
-                          SessionBroadcaster broadcaster) {
+                          SessionBroadcaster broadcaster,
+                          @Value("${chat.projection.sync-enabled:false}") boolean syncProjectionEnabled) {
         this.eventStore = eventStore;
         this.projectionUpdater = projectionUpdater;
         this.sessionDao = sessionDao;
         this.broadcaster = broadcaster;
+        this.syncProjectionEnabled = syncProjectionEnabled;
+    }
+
+    @PostConstruct
+    void warnIfSyncProjectionEnabled() {
+        if (syncProjectionEnabled) {
+            log.warn("chat.projection.sync-enabled=true: 운영 사용 금지, read model 동기+비동기 이중 적용 위험. 테스트/디버깅 전용.");
+        }
     }
 
     /**
@@ -95,8 +112,11 @@ public class CommandHandler {
         // 멱등 재유입(isNew=false)이면 projection·broadcast를 생략하고 기존 이벤트만 반환한다.
         // 첫 처리 시 이미 projection·broadcast가 수행되었으므로 중복 적용/전달을 막는다(§4.1 계층2, §6).
         if (result.isNew()) {
-            // (e) 동기 projection — 같은 트랜잭션(§13 Phase 1, §4.1 계층2)
-            projectionUpdater.apply(stored);
+            // (e) 동기 projection — 기본 비활성. syncProjectionEnabled=true일 때만 실행(테스트/디버깅 전용).
+            // Phase 2 비동기 파이프라인에서 projection은 EventListener가 담당하므로 운영 시 false 유지.
+            if (syncProjectionEnabled) {
+                projectionUpdater.apply(stored);
+            }
 
             // (f) 커밋 후 실시간 팬아웃(§6). 동기화 비활성 상황(테스트/배치)에서는 즉시 전송.
             publishAfterCommit(sessionId, stored);

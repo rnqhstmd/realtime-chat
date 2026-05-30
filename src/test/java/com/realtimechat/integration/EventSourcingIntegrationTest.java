@@ -1,5 +1,6 @@
 package com.realtimechat.integration;
 
+import static com.realtimechat.support.AwaitProjection.awaitProjection;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -74,20 +75,25 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
                 "msg-" + messageId, alice);
         assertThat(sent.seq()).isEqualTo(2L);
 
-        // 동기 projection으로 message_view가 즉시 갱신됨
-        List<MessageViewDao.MessageRow> recent = messageViewDao.findRecent(sessionId, 10);
-        assertThat(recent).hasSize(1);
-        assertThat(recent.get(0).content()).isEqualTo("hello world");
-        assertThat(recent.get(0).state()).isEqualTo("SENT");
+        // 비동기 projection 반영 대기: message_view
+        awaitProjection(() -> {
+            List<MessageViewDao.MessageRow> recent = messageViewDao.findRecent(sessionId, 10);
+            assertThat(recent).hasSize(1);
+            assertThat(recent.get(0).content()).isEqualTo("hello world");
+            assertThat(recent.get(0).state()).isEqualTo("SENT");
+        });
 
-        // session_view 반영 확인
-        assertThat(sessionService.get(sessionId)).isPresent();
-        assertThat(sessionService.get(sessionId).get().participantCount()).isEqualTo(1);
-        assertThat(sessionService.get(sessionId).get().messageCount()).isEqualTo(1);
+        // 비동기 projection 반영 대기: session_view
+        awaitProjection(() -> {
+            assertThat(sessionService.get(sessionId)).isPresent();
+            assertThat(sessionService.get(sessionId).get().participantCount()).isEqualTo(1);
+            assertThat(sessionService.get(sessionId).get().messageCount()).isEqualTo(1);
+        });
 
         // 종료
         sessionService.end(sessionId);
-        assertThat(sessionService.get(sessionId).get().status()).isEqualTo("ENDED");
+        awaitProjection(() ->
+            assertThat(sessionService.get(sessionId).get().status()).isEqualTo("ENDED"));
     }
 
     // =====================================================================
@@ -116,9 +122,11 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
         List<StoredEvent> all = eventStore.findBySeqRange(sessionId, 0, Long.MAX_VALUE);
         assertThat(all).hasSize(1);
 
-        // message_view도 1건, message_count 중복 증가 없음
-        assertThat(messageViewDao.findRecent(sessionId, 10)).hasSize(1);
-        assertThat(sessionService.get(sessionId).get().messageCount()).isEqualTo(1);
+        // 비동기 projection 반영 대기: message_view도 1건, message_count 중복 증가 없음
+        awaitProjection(() -> {
+            assertThat(messageViewDao.findRecent(sessionId, 10)).hasSize(1);
+            assertThat(sessionService.get(sessionId).get().messageCount()).isEqualTo(1);
+        });
     }
 
     // =====================================================================
@@ -174,14 +182,17 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
         commandHandler.handle(sessionId, EventType.MESSAGE_SENT,
                 node(new MessageSentPayload(m3, sender, "third")), "s3", sender);
 
-        List<MessageViewDao.MessageRow> recent = messageViewDao.findRecent(sessionId, 10);
-        // DELETED(m2) 제외 → m1, m3만 / seq DESC → m3(seq5) 먼저, m1(seq1) 나중
-        assertThat(recent).hasSize(2);
-        assertThat(recent.get(0).messageId()).isEqualTo(m3);
-        assertThat(recent.get(1).messageId()).isEqualTo(m1);
-        // m1은 EDITED 상태로 content 갱신
-        assertThat(recent.get(1).state()).isEqualTo("EDITED");
-        assertThat(recent.get(1).content()).isEqualTo("first-edited");
+        // 비동기 projection 반영 대기: message_view 상태 전이
+        awaitProjection(() -> {
+            List<MessageViewDao.MessageRow> recent = messageViewDao.findRecent(sessionId, 10);
+            // DELETED(m2) 제외 → m1, m3만 / seq DESC → m3(seq5) 먼저, m1(seq1) 나중
+            assertThat(recent).hasSize(2);
+            assertThat(recent.get(0).messageId()).isEqualTo(m3);
+            assertThat(recent.get(1).messageId()).isEqualTo(m1);
+            // m1은 EDITED 상태로 content 갱신
+            assertThat(recent.get(1).state()).isEqualTo("EDITED");
+            assertThat(recent.get(1).content()).isEqualTo("first-edited");
+        });
     }
 
     // =====================================================================
@@ -326,27 +337,27 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
 
         // join(A) → 1
         sessionService.join(sessionId, alice, "j-a");
-        assertThat(participantCount(sessionId)).isEqualTo(1);
+        awaitProjection(() -> assertThat(participantCount(sessionId)).isEqualTo(1));
 
         // join(B) → 2
         sessionService.join(sessionId, bob, "j-b");
-        assertThat(participantCount(sessionId)).isEqualTo(2);
+        awaitProjection(() -> assertThat(participantCount(sessionId)).isEqualTo(2));
 
         // leave(A) → 1
         leave(sessionId, alice, "l-a-1");
-        assertThat(participantCount(sessionId)).isEqualTo(1);
+        awaitProjection(() -> assertThat(participantCount(sessionId)).isEqualTo(1));
 
         // 동일 참여자(A)에 대해 다른 멱등키로 LEFT 한번 더 → 이미 LEFT라 과차감 없음, 여전히 1
         leave(sessionId, alice, "l-a-2");
-        assertThat(participantCount(sessionId)).isEqualTo(1);
+        awaitProjection(() -> assertThat(participantCount(sessionId)).isEqualTo(1));
 
         // rejoin(A) → 2 (LEFT→JOINED 전이로 다시 증가, 비대칭 없음)
         sessionService.join(sessionId, alice, "j-a-2");
-        assertThat(participantCount(sessionId)).isEqualTo(2);
+        awaitProjection(() -> assertThat(participantCount(sessionId)).isEqualTo(2));
 
         // 중복 JOINED(이미 JOINED, 다른 멱등키) → 증가 안 함, 여전히 2
         sessionService.join(sessionId, alice, "j-a-3");
-        assertThat(participantCount(sessionId)).isEqualTo(2);
+        awaitProjection(() -> assertThat(participantCount(sessionId)).isEqualTo(2));
     }
 
     // =====================================================================
@@ -394,10 +405,13 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
         commandHandler.handle(sessionId, EventType.MESSAGE_SENT,
                 node(new MessageSentPayload(messageId, sender, "once")), key, sender);
 
-        // 이벤트 1건, message_view 1건, message_count 1 (projection 단일 적용)
+        // 이벤트 1건 (event store 직접 조회, 비동기 무관)
         assertThat(eventStore.findBySeqRange(sessionId, 0, Long.MAX_VALUE)).hasSize(1);
-        assertThat(messageViewDao.findRecent(sessionId, 10)).hasSize(1);
-        assertThat(sessionService.get(sessionId).orElseThrow().messageCount()).isEqualTo(1);
+        // 비동기 projection 반영 대기: message_view 1건, message_count 1 (projection 단일 적용)
+        awaitProjection(() -> {
+            assertThat(messageViewDao.findRecent(sessionId, 10)).hasSize(1);
+            assertThat(sessionService.get(sessionId).orElseThrow().messageCount()).isEqualTo(1);
+        });
     }
 
     // =====================================================================
@@ -434,14 +448,21 @@ class EventSourcingIntegrationTest extends AbstractIntegrationTest {
         leave(sessionId, alice, "l-a-1");                                          // seq 2
         StoredEvent rejoin = sessionService.join(sessionId, alice, "j-a-2");       // seq 3
 
-        // 동기 projection: participant_view.joined_seq가 재참여 seq(3)로 갱신됨(이전 join seq 1 아님)
+        // 비동기 projection 반영 대기: participant_view.joined_seq가 재참여 seq(3)로 갱신됨(이전 join seq 1 아님)
+        awaitProjection(() -> {
+            Long projectionJoinedSeq = jdbcTemplate.queryForObject(
+                    "SELECT joined_seq FROM participant_view WHERE session_id = ? AND participant_id = ?",
+                    Long.class, sessionId, alice);
+            assertThat(projectionJoinedSeq).isEqualTo(rejoin.seq());
+            assertThat(projectionJoinedSeq).isNotEqualTo(firstJoin.seq());
+        });
+
+        // projection 반영 완료 후 값 조회(복원 모델과 비교용)
         Long projectionJoinedSeq = jdbcTemplate.queryForObject(
                 "SELECT joined_seq FROM participant_view WHERE session_id = ? AND participant_id = ?",
                 Long.class, sessionId, alice);
-        assertThat(projectionJoinedSeq).isEqualTo(rejoin.seq());
-        assertThat(projectionJoinedSeq).isNotEqualTo(firstJoin.seq());
 
-        // 복원 모델(event replay)의 joinedSeq도 재참여 seq → 동기 projection과 일치
+        // 복원 모델(event replay)의 joinedSeq도 재참여 seq → projection과 일치
         SessionState restored = restoreService.restoreTo(sessionId, rejoin.seq());
         assertThat(restored.participant(alice).status()).isEqualTo("JOINED");
         assertThat(restored.participant(alice).joinedSeq()).isEqualTo(rejoin.seq());

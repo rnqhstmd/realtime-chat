@@ -1,5 +1,6 @@
 package com.realtimechat.support;
 
+import com.redis.testcontainers.RedisContainer;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
@@ -8,6 +9,7 @@ import org.springframework.boot.testcontainers.service.connection.ServiceConnect
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -44,8 +46,18 @@ public abstract class AbstractIntegrationTest {
     static final PostgreSQLContainer<?> POSTGRES =
             new PostgreSQLContainer<>("postgres:16");
 
+    /**
+     * 모든 통합 테스트가 공유하는 Redis 7 컨테이너(싱글톤). PostgreSQL 컨테이너와 동일한 패턴으로
+     * static 초기화에서 1회 기동하고 stop하지 않는다. {@link ServiceConnection}이
+     * spring.data.redis.host/port를 자동 주입한다.
+     */
+    @ServiceConnection
+    static final RedisContainer REDIS =
+            new RedisContainer(DockerImageName.parse("redis:7").asCompatibleSubstituteFor("redis"));
+
     static {
         POSTGRES.start();
+        REDIS.start();
     }
 
     @Autowired
@@ -60,14 +72,15 @@ public abstract class AbstractIntegrationTest {
     void flywayCreatesSchemaOnContainer() {
         for (String table : new String[] {
                 "session", "event", "outbox",
-                "participant_view", "message_view", "session_view", "snapshot"
+                "participant_view", "message_view", "session_view", "snapshot",
+                "projection_offset"
         }) {
             Integer count = jdbcTemplate.queryForObject(
                     "SELECT count(*) FROM information_schema.tables "
                             + "WHERE table_schema = 'public' AND table_name = ?",
                     Integer.class, table);
             assertThat(count)
-                    .as("table '%s' should be created by Flyway V1", table)
+                    .as("table '%s' should be created by Flyway migration", table)
                     .isEqualTo(1);
         }
     }

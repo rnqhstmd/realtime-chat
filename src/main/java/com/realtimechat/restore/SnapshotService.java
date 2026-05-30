@@ -54,14 +54,26 @@ public class SnapshotService {
         if (!sessionDao.exists(sessionId)) {
             throw new SessionNotFoundException(sessionId);
         }
-        long maxSeq = eventStore.maxSeq(sessionId);
-        if (maxSeq == 0L) {
+        createSnapshot(sessionId, eventStore.maxSeq(sessionId));
+    }
+
+    /**
+     * 지정한 seq 시점까지의 스냅샷을 생성한다(비동기 Projection Worker가 적용 위치에서 호출).
+     *
+     * <p>up_to_seq가 worker 적용 seq와 정렬되어 (session_id, up_to_seq) 멱등 저장이 N건 주기로 정확히
+     * 동작한다. upToSeq &lt;= 0이면 no-op. 세션이 없으면 {@link SessionNotFoundException}(404).
+     */
+    @Transactional
+    public void createSnapshot(UUID sessionId, long upToSeq) {
+        if (!sessionDao.exists(sessionId)) {
+            throw new SessionNotFoundException(sessionId);
+        }
+        if (upToSeq <= 0L) {
             return;
         }
-
-        SessionState state = restoreService.restoreTo(sessionId, maxSeq);
+        SessionState state = restoreService.restoreTo(sessionId, upToSeq);
         SnapshotState snapshotState = SnapshotState.from(state, recentMessages);
         JsonNode stateJson = JsonUtil.toJsonNode(snapshotState);
-        snapshotDao.save(sessionId, maxSeq, stateJson);
+        snapshotDao.save(sessionId, upToSeq, stateJson);
     }
 }

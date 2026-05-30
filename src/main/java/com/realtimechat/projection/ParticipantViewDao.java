@@ -134,6 +134,25 @@ public class ParticipantViewDao {
     private record Row(String status, long lastAppliedSeq) {
     }
 
+    /**
+     * presence 변경을 적용한다(seq-guard).
+     *
+     * <p>늦게 도착한 과거 PRESENCE_CHANGED 이벤트는 {@code last_applied_seq} seq-guard
+     * ({@code :seq > last_applied_seq})에 의해 silently drop될 수 있다. 이는 의도된 동작이다:
+     * <ol>
+     *   <li>presence는 휘발성·최신 우선 데이터다. Redis TTL이 권위 있는 상태이며, 이벤트는 감사
+     *       목적으로 기록된다.</li>
+     *   <li>정확한 과거 presence 복원이 필요한 경우 replay 경로({@code Fold})가 BR-6 기준으로
+     *       제공된다.</li>
+     *   <li>presence 전용 seq 컬럼을 별도로 두는 것은 과설계다. {@code last_applied_seq} 공유로
+     *       충분하다.</li>
+     * </ol>
+     *
+     * @param sessionId     세션 ID
+     * @param participantId 참여자 ID
+     * @param presence      변경된 presence 값 (예: "ONLINE", "OFFLINE")
+     * @param seq           이벤트 seq. {@code last_applied_seq} 이하면 적용을 건너뛴다.
+     */
     public void applyPresence(UUID sessionId, UUID participantId, String presence, long seq) {
         MapSqlParameterSource params = new MapSqlParameterSource()
                 .addValue("sid", sessionId)

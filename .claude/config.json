@@ -1,0 +1,68 @@
+{
+  "vcs": "git",
+  "issueKey": {
+    "pattern": "^[A-Z]+-[0-9]+$",
+    "description": "대문자 영문 1자 이상 + '-' + 숫자 1자 이상 (e.g., JIRA-123, AFS-6)"
+  },
+  "conventions": {
+    "branchTypes": ["feat", "fix", "refactor", "chore", "docs", "test", "style", "perf", "ci"],
+    "branchFormat": "{type}/{description}",
+    "commitFormat": "{type}: {message}",
+    "prTitleMapping": {
+      "feat": "FEATURE",
+      "fix": "BUGFIX",
+      "refactor": "REFACTOR",
+      "chore": "CHORE",
+      "docs": "DOCS",
+      "test": "TEST",
+      "style": "STYLE",
+      "perf": "PERF",
+      "ci": "CI"
+    }
+  },
+  "sensitiveFilePatterns": [
+    ".env*",
+    "*.key",
+    "*.pem",
+    "credentials*",
+    "*secret*"
+  ],
+  "buildArtifactPatterns": [
+    "build/",
+    ".gradle/",
+    "node_modules/",
+    "dist/"
+  ],
+  "timeouts": {
+    "build": 300000,
+    "network": 120000,
+    "install": 300000
+  },
+  "projectTypes": {
+    "java-spring": {
+      "detect": ["build.gradle.kts", "build.gradle"],
+      "build": "./gradlew build"
+    },
+    "node": {
+      "detect": ["package.json"],
+      "build": "npm run build"
+    }
+  },
+  "notifications": {
+    "googleChat": {
+      "enabled": false,
+      "webhookUrl": ""
+    }
+  },
+  "contextLimits": {
+    "product-owner": { "maxInputLines": 500, "note": "PRD 작성에 필요한 요구사항 + 코드 맵" },
+    "architect": { "maxInputLines": 1000, "note": "PRD + 코드 맵 + 참조 코드" },
+    "design-critic": { "maxInputLines": 800, "note": "설계서 + PRD + 코드 맵" },
+    "coder": { "maxInputLines": 2000, "note": "설계서 + 코드 맵 + 참조 코드가 가장 큼" },
+    "qa-manager": { "maxInputLines": 1500, "note": "diff가 클 수 있음" },
+    "security-auditor": { "maxInputLines": 1500, "note": "PRD + 설계서 + diff" },
+    "researcher": { "maxInputLines": 1000, "note": "조사 요청 + 코드 맵" },
+    "hacker": { "maxInputLines": 800, "note": "정체 상황 + 코드 맵" },
+    "simplifier": { "maxInputLines": 1000, "note": "정체 상황 + 설계서 + PRD + 코드 맵" }
+  }
+}

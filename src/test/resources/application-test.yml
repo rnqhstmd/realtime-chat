@@ -10,3 +10,18 @@ logging:
   level:
     root: INFO
     com.realtimechat: DEBUG
+
+# 테스트 튜닝: 비동기 파이프라인이 테스트 시간 내에 결정적으로 동작하도록 main의 chat.* 값을 오버라이드.
+# (기존 39개 통합 테스트도 이 프로파일을 공유하나, 아래 값은 멱등·비치명적이라 무해하다.)
+chat:
+  outbox:
+    relay:
+      poll-interval-ms: 100      # relay 폴링을 빠르게(500→100): outbox→stream 발행 지연 단축(AC-3).
+  projection:
+    sync-enabled: false          # 비동기 경로(ProjectionWorker)만 검증함을 명시(동기 projection 비활성).
+  snapshot:
+    trigger-interval: 5          # AC-9: 5건마다 스냅샷 자동 생성(200→5)으로 짧은 시퀀스로 트리거 검증.
+  redis:
+    claim-min-idle-ms: 1000      # AC-5: pending 재청구 idle 임계를 30s→1s로 낮춰 테스트 시간 내 재청구·DLQ 검증.
+    read-block-ms: 200           # worker XREADGROUP BLOCK을 짧게(2000→200)하여 소비 루프를 빠르게.
+    max-attempts: 3              # DLQ 격리 전 재시도 횟수(명시).
