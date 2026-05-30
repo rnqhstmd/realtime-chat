@@ -73,16 +73,18 @@ public class ProjectionApplier {
     public void apply(StoredEvent incoming) {
         UUID sessionId = incoming.sessionId();
 
-        // (1) projection_offset을 FOR UPDATE로 잠가 세션 단위 직렬화. 행이 없으면 0으로 초기화.
-        long lastApplied = offsetDao.selectForUpdateOrInit(sessionId);
+        // (1) 단일 upsert로 행 잠금 획득과 현재 오프셋 조회를 원자적으로 수행(락 공백·왕복 제거).
+        ProjectionOffsetDao.Offset off = offsetDao.lockOrInit(sessionId);
+        long lastApplied = off.lastAppliedSeq();
 
         // (2) seq-guard 1차(BR-2): 이미 본 seq면 read model 미수정 no-op 정상 종료(호출자가 XACK).
+        //     lockOrInit이 행 잠금을 보유하므로 TX 종료 시 잠금이 해제된다(정상).
         if (incoming.seq() <= lastApplied) {
             return;
         }
 
         // (3) 적용 전 스냅샷 카운터(마지막 스냅샷 이후 잔여 건수). 항상 [0, triggerInterval) 범위.
-        long since0 = offsetDao.snapshotCounter(sessionId);
+        long since0 = off.eventsSinceSnapshot();
 
         // (4) 적용 범위 결정.
         List<StoredEvent> events;

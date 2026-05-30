@@ -15,21 +15,25 @@ import java.util.UUID;
 @Repository
 public class ProjectionOffsetDao {
 
-    /** 행이 없을 때 초기화(ON CONFLICT DO NOTHING으로 멱등 보장). */
-    private static final String INSERT_IF_ABSENT_SQL =
+    /**
+     * projection_offset의 현재 오프셋 상태를 담는 값 객체.
+     *
+     * @param lastAppliedSeq      마지막으로 적용된 seq
+     * @param eventsSinceSnapshot 마지막 스냅샷 이후 누적 이벤트 수 (잔여 카운터)
+     */
+    public record Offset(long lastAppliedSeq, long eventsSinceSnapshot) {}
+
+    /**
+     * 단일 upsert로 행 잠금과 현재값 조회를 동시에 수행한다.
+     *
+     * <p>ON CONFLICT DO UPDATE(no-op self-update)는 충돌 행에 FOR UPDATE 등가의 행 잠금을 획득하고,
+     * RETURNING이 INSERT/UPDATE 양쪽 모두에서 현재값을 반환한다. 신규 INSERT 시 DB 기본값(0, 0)을 반환한다.
+     */
+    private static final String LOCK_OR_INIT_SQL =
             "INSERT INTO projection_offset (session_id)"
                     + " VALUES (:sid)"
-                    + " ON CONFLICT (session_id) DO NOTHING";
-
-    /** FOR UPDATE로 행을 잠그고 last_applied_seq 반환. */
-    private static final String SELECT_FOR_UPDATE_SQL =
-            "SELECT last_applied_seq FROM projection_offset"
-                    + " WHERE session_id = :sid FOR UPDATE";
-
-    /** events_since_snapshot 현재값 조회(행은 selectForUpdateOrInit의 FOR UPDATE로 같은 TX에서 잠겨 있음). */
-    private static final String SNAPSHOT_COUNTER_SQL =
-            "SELECT events_since_snapshot FROM projection_offset"
-                    + " WHERE session_id = :sid";
+                    + " ON CONFLICT (session_id) DO UPDATE SET session_id = EXCLUDED.session_id"
+                    + " RETURNING last_applied_seq, events_since_snapshot";
 
     /** last_applied_seq와 events_since_snapshot을 절대값으로 SET. */
     private static final String UPDATE_OFFSET_SQL =
@@ -46,33 +50,22 @@ public class ProjectionOffsetDao {
     }
 
     /**
-     * 세션의 last_applied_seq를 FOR UPDATE로 잠근 뒤 반환한다.
+     * 단일 SQL로 행 잠금과 현재 오프셋 조회를 원자적으로 수행한다.
      *
-     * <p>행이 없으면 INSERT(초기값 last_applied_seq=0, events_since_snapshot=0)한 후 0을 반환한다.
-     * 호출자 트랜잭션 내에서 실행되어야 한다.
+     * <p>행이 없으면 INSERT(초기값 last_applied_seq=0, events_since_snapshot=0)하면서 잠금을 획득하고,
+     * 행이 있으면 ON CONFLICT DO UPDATE로 충돌 행에 행 잠금을 획득한 뒤 현재값을 RETURNING으로 반환한다.
+     * 기존 INSERT ON CONFLICT DO NOTHING + 별도 SELECT FOR UPDATE 2회 왕복과
+     * 그 사이의 락 공백을 제거한다. 호출자 트랜잭션 내에서 실행되어야 한다.
      *
      * @param sessionId 대상 세션 ID
-     * @return 현재 last_applied_seq (행 최초 생성 시 0)
+     * @return 현재 오프셋 상태 (행 최초 생성 시 lastAppliedSeq=0, eventsSinceSnapshot=0)
      */
-    public long selectForUpdateOrInit(UUID sessionId) {
+    public Offset lockOrInit(UUID sessionId) {
         MapSqlParameterSource params = sidParams(sessionId);
-        jdbc.update(INSERT_IF_ABSENT_SQL, params);
-        Long seq = jdbc.queryForObject(SELECT_FOR_UPDATE_SQL, params, Long.class);
-        return seq != null ? seq : 0L;
-    }
-
-    /**
-     * 세션의 현재 events_since_snapshot 카운터 값을 조회한다.
-     *
-     * <p>행은 {@link #selectForUpdateOrInit}의 FOR UPDATE로 같은 트랜잭션에서 이미 잠겨 있으므로
-     * 일반 SELECT로 현재값을 조회한다. 항상 {@code [0, triggerInterval)} 범위의 잔여 건수다.
-     *
-     * @param sessionId 대상 세션 ID
-     * @return 현재 events_since_snapshot (행/값이 없으면 0)
-     */
-    public long snapshotCounter(UUID sessionId) {
-        Long since = jdbc.queryForObject(SNAPSHOT_COUNTER_SQL, sidParams(sessionId), Long.class);
-        return since != null ? since : 0L;
+        return jdbc.queryForObject(LOCK_OR_INIT_SQL, params,
+                (rs, rowNum) -> new Offset(
+                        rs.getLong("last_applied_seq"),
+                        rs.getLong("events_since_snapshot")));
     }
 
     /**
