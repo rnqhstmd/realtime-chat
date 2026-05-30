@@ -66,18 +66,24 @@ public class ProjectionWorker implements SmartLifecycle {
     private final StreamProps props;
     private final EventStreamCodec codec;
     private final ProjectionApplier projectionApplier;
+    private final ProjectionLagMetrics lagMetrics;
 
     private volatile boolean running = false;
     private Thread worker;
 
+    /** 마지막 reclaim 패스 시각(ms). throttle로 reclaim 패스를 claimMinIdleMs마다 1회로 제한한다. */
+    private long lastReclaimAtMs = 0L;
+
     public ProjectionWorker(StringRedisTemplate redisTemplate,
                             StreamProps props,
                             EventStreamCodec codec,
-                            ProjectionApplier projectionApplier) {
+                            ProjectionApplier projectionApplier,
+                            ProjectionLagMetrics lagMetrics) {
         this.redisTemplate = redisTemplate;
         this.props = props;
         this.codec = codec;
         this.projectionApplier = projectionApplier;
+        this.lagMetrics = lagMetrics;
     }
 
     // ---- SmartLifecycle ----
@@ -199,25 +205,35 @@ public class ProjectionWorker implements SmartLifecycle {
      * <p>이 그룹의 pending 목록을 조회해 idle 시간이 {@code claimMinIdleMs}(기본 30s) 이상인 것만
      * 처리한다(idle 미달은 skip하여 ~30s 백오프 근사). deliveryCount가 maxAttempts 이하면 청구·재처리하고,
      * 초과하면 DLQ로 격리한다(BR-3/AC-5).
+     *
+     * <p><b>throttle</b>: idle 게이트({@code claimMinIdleMs})가 이미 메시지별 재청구 주기를 제한하므로,
+     * 전체 reclaim 패스 자체도 {@code claimMinIdleMs}마다 1회로 제한한다. 재처리 지연 없이 매 루프의
+     * XPENDING 풀스캔 왕복만 줄인다.
+     *
+     * <p><b>단일 윈도우</b>: 가장 오래된 {@code readCount}건만 조회한다(유계라 안정적). 오래된 항목이
+     * 먼저 DLQ로 빠지며 백로그가 패스마다 자연 배수된다.
      */
     private void reclaimPending() {
+        // throttle: claimMinIdleMs마다 1회만 reclaim 패스 실행(XPENDING 풀스캔 빈도 제한).
+        long now = System.currentTimeMillis();
+        if (now - lastReclaimAtMs < props.claimMinIdleMs()) {
+            return;
+        }
+        lastReclaimAtMs = now;
+
         PendingMessages pending = redisTemplate.opsForStream()
                 .pending(props.stream(), props.group(), Range.unbounded(), props.readCount());
-
         if (pending == null || pending.isEmpty()) {
             return;
         }
-
         for (PendingMessage message : pending) {
             long idleMs = message.getElapsedTimeSinceLastDelivery().toMillis();
             if (idleMs < props.claimMinIdleMs()) {
                 // idle 미달: 아직 원소비자가 처리 중일 수 있으므로 skip(백오프 근사).
                 continue;
             }
-
             RecordId id = message.getId();
             long deliveryCount = message.getTotalDeliveryCount();
-
             if (deliveryCount > props.maxAttempts()) {
                 moveToDlq(id, deliveryCount);
             } else {
@@ -275,6 +291,8 @@ public class ProjectionWorker implements SmartLifecycle {
                         deliveryCount,
                         props.dlqStream());
             } catch (RuntimeException ex) {
+                // DLQ 적재 실패를 카운터로 추적(운영 알림 기반). 정체 방지(finally XACK)는 그대로.
+                lagMetrics.recordDlqWriteFailure();
                 log.error("DLQ XADD 실패 — 본 스트림 XACK로 정체 방지(event store 복원 가능): "
                                 + "event_id={}, session_id={}, seq={}",
                         fields.get(StreamConstants.FIELD_EVENT_ID),

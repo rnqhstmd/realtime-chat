@@ -8,6 +8,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -47,6 +48,13 @@ public class ProjectionApplier {
     private final SnapshotService snapshotService;
     private final ProjectionLagMetrics lagMetrics;
 
+    /**
+     * 스냅샷 생성 전용 단일 스레드 executor(SnapshotExecutorConfig). afterCommit 콜백에서 스냅샷
+     * 생성을 이 executor로 위임하여 ProjectionWorker 소비 루프가 replay(restoreTo) 동안 블로킹되지
+     * 않게 한다. 단일 스레드라 직렬 처리되며, 스냅샷 PK 멱등(BR-5)으로 중복도 무해하다.
+     */
+    private final ExecutorService snapshotExecutor;
+
     /** events_since_snapshot이 이 값에 도달하면 스냅샷을 트리거한다(§11, FR-P2-8, Q3). */
     private final long triggerInterval;
 
@@ -55,12 +63,14 @@ public class ProjectionApplier {
                              EventStore eventStore,
                              SnapshotService snapshotService,
                              ProjectionLagMetrics lagMetrics,
+                             ExecutorService snapshotExecutor,
                              @Value("${chat.snapshot.trigger-interval:200}") long triggerInterval) {
         this.offsetDao = offsetDao;
         this.projectionUpdater = projectionUpdater;
         this.eventStore = eventStore;
         this.snapshotService = snapshotService;
         this.lagMetrics = lagMetrics;
+        this.snapshotExecutor = snapshotExecutor;
         this.triggerInterval = triggerInterval;
     }
 
@@ -107,7 +117,12 @@ public class ProjectionApplier {
         List<Long> snapshotSeqs = new ArrayList<>();
         for (StoredEvent event : events) {
             projectionUpdater.apply(event);
-            lagMetrics.record(event.occurredAt(), Instant.now());
+            // lag은 live(incoming) 이벤트에 대해서만 기록한다. gap-fill 보강분은 과거 이벤트라
+            // lag이 크게 잡혀 lastLag/maxLag을 왜곡하므로 제외한다(정상 경로는 events가 incoming
+            // 1건이라 동일 동작, gap-fill은 마지막 incoming만 기록).
+            if (event.seq() == incoming.seq()) {
+                lagMetrics.record(event.occurredAt(), Instant.now());
+            }
             running++;
             if (snapshotEnabled && running % triggerInterval == 0) {
                 snapshotSeqs.add(event.seq());
@@ -131,31 +146,40 @@ public class ProjectionApplier {
 
     /**
      * 커밋 직후 스냅샷 생성을 등록한다(설계서 §11 afterCommit). 트랜잭션 동기화가 활성일 때만
-     * afterCommit 콜백을 등록하고, 비활성(동기화 없는 호출 경로)이면 즉시 실행한다.
-     *
-     * <p>{@link SnapshotService#createSnapshot}는 자체 {@code @Transactional}이라 afterCommit 시점에
-     * 새 트랜잭션으로 실행된다. 실패해도 projection을 중단시키지 않도록 try-catch로 감싸 WARN만
-     * 남긴다(FR-P2-8: 스냅샷 실패는 projection 비중단).
+     * afterCommit 콜백을 등록하고, 비활성(동기화 없는 호출 경로)이면 즉시 위임한다. 어느 경로든
+     * 스냅샷 생성은 {@code snapshotExecutor}로 submit되어 worker 스레드를 즉시 반환시킨다(gemini ⓒ).
+     * afterCommit 등록은 유지되므로 "apply TX 커밋 성공 후에만" 스냅샷이 시작되며 롤백 시에는
+     * submit 자체가 일어나지 않는다.
      */
     private void triggerSnapshotAfterCommit(UUID sessionId, long upToSeq) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    createSnapshotBestEffort(sessionId, upToSeq);
+                    submitSnapshot(sessionId, upToSeq);
                 }
             });
         } else {
-            createSnapshotBestEffort(sessionId, upToSeq);
+            submitSnapshot(sessionId, upToSeq);
         }
     }
 
-    /** 스냅샷 생성을 best-effort로 수행. 실패해도 projection 흐름을 막지 않고 WARN만 남긴다(FR-P2-8). */
-    private void createSnapshotBestEffort(UUID sessionId, long upToSeq) {
-        try {
-            snapshotService.createSnapshot(sessionId, upToSeq);
-        } catch (RuntimeException ex) {
-            log.warn("Snapshot creation failed for session={}, projection continues (FR-P2-8)", sessionId, ex);
-        }
+    /**
+     * 스냅샷 생성을 전용 executor에 submit한다(gemini ⓒ). worker 소비 루프가 replay(restoreTo) 동안
+     * 블로킹되지 않도록 createSnapshot을 inline 실행하지 않고 즉시 위임한다.
+     *
+     * <p>{@link SnapshotService#createSnapshot}는 Spring 빈(프록시)이라 executor 스레드에서 호출해도
+     * 자체 {@code @Transactional}이 새 TX로 정상 적용된다. best-effort로 try-catch로 감싸 실패해도
+     * projection 흐름을 막지 않고 WARN만 남긴다(FR-P2-8: 스냅샷 실패는 projection 비중단).
+     */
+    private void submitSnapshot(UUID sessionId, long upToSeq) {
+        snapshotExecutor.submit(() -> {
+            try {
+                snapshotService.createSnapshot(sessionId, upToSeq);
+            } catch (RuntimeException ex) {
+                log.warn("Snapshot creation failed for session={}, upToSeq={}, projection continues (FR-P2-8)",
+                        sessionId, upToSeq, ex);
+            }
+        });
     }
 }

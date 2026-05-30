@@ -5,6 +5,9 @@ spring:
     locations: classpath:db/migration
   jackson:
     default-property-inclusion: non_null
+  datasource:
+    hikari:
+      maximum-pool-size: 20      # 다중 @SpringBootTest 컨텍스트(worker/relay/snapshot 스레드) 동시 생존 시 커넥션 경합 완화
 
 logging:
   level:
@@ -22,6 +25,7 @@ chat:
   snapshot:
     trigger-interval: 5          # AC-9: 5건마다 스냅샷 자동 생성(200→5)으로 짧은 시퀀스로 트리거 검증.
   redis:
+    consumer: test-${random.uuid}  # 컨텍스트별 고유 컨슈머: 캐시된 다중 컨텍스트 worker가 PEL을 공유/탈취하지 않도록 격리
     claim-min-idle-ms: 1000      # AC-5: pending 재청구 idle 임계를 30s→1s로 낮춰 테스트 시간 내 재청구·DLQ 검증.
     read-block-ms: 200           # worker XREADGROUP BLOCK을 짧게(2000→200)하여 소비 루프를 빠르게.
     max-attempts: 3              # DLQ 격리 전 재시도 횟수(명시).

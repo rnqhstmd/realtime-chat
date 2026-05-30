@@ -55,6 +55,7 @@ public class EventStreamCodec {
         EventType type      = EventType.valueOf(fields.get(StreamConstants.FIELD_TYPE));
         var payload         = JsonUtil.readTree(fields.get(StreamConstants.FIELD_PAYLOAD));
         String idempotencyKey = fields.get(StreamConstants.FIELD_IDEMPOTENCY_KEY);
+        // actorId는 nullable(UUID는 빈 문자열일 수 없음). toFields가 null을 ""로 직렬화하므로 ""/null/blank를 모두 null로 복원.
         String actorIdRaw   = fields.get(StreamConstants.FIELD_ACTOR_ID);
         UUID actorId        = (actorIdRaw == null || actorIdRaw.isBlank())
                               ? null

@@ -18,6 +18,7 @@ public class ProjectionLagMetrics {
 
     private final AtomicLong lastLagMillis = new AtomicLong(0L);
     private final AtomicLong maxLagMillis = new AtomicLong(0L);
+    private final AtomicLong dlqWriteFailures = new AtomicLong(0L);
 
     /** 이벤트가 read model에 반영된 시점에 호출. lag = now - occurredAt. */
     public void record(Instant occurredAt, Instant appliedAt) {
@@ -33,6 +34,12 @@ public class ProjectionLagMetrics {
         log.debug("projection lag: {} ms (occurredAt={}, appliedAt={})", lag, occurredAt, appliedAt);
     }
 
+    /** DLQ XADD 실패 시 호출. 운영 알림(Phase 3 관측성)의 기반 카운터. */
+    public void recordDlqWriteFailure() {
+        dlqWriteFailures.incrementAndGet();
+    }
+
     public long lastLagMillis() { return lastLagMillis.get(); }
     public long maxLagMillis() { return maxLagMillis.get(); }
+    public long dlqWriteFailures() { return dlqWriteFailures.get(); }
 }

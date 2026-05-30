@@ -36,7 +36,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  *   <li>멱등 키·세션 상태 검증(§4.1, §11),</li>
  *   <li>타입별 payload 검증·보강(§3.1: 검증은 append 전 커맨드 경계에서 완료),</li>
  *   <li>{@link EventStore#append}로 seq 채번 + 수집 멱등(§4.1 계층1),</li>
- *   <li>{@link ProjectionUpdater#apply}로 동기 projection(§13 Phase 1),</li>
+ *   <li>{@link ProjectionUpdater#apply}로 동기 projection — {@code chat.projection.sync-enabled=true}일 때만
+ *       실행(기본 {@code false}, 테스트/디버깅 전용). 운영의 read model 갱신은 비동기 ProjectionWorker 경로가 유일함,</li>
  *   <li>커밋 직후 {@link SessionBroadcaster}로 실시간 팬아웃(§6)</li>
  * </ol>
  * 을 수행한다. 전송(broadcast)은 진실의 원천을 오염시키지 않도록 <b>afterCommit</b>에서만 일어난다.
