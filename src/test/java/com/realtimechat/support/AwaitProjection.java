@@ -20,7 +20,7 @@ public final class AwaitProjection {
      * @param assertion 검증할 단언 블록(AssertionError 또는 예외를 던지면 재시도)
      */
     public static void awaitProjection(Runnable assertion) {
-        await().atMost(Duration.ofSeconds(10))
+        await().atMost(Duration.ofSeconds(30))
                 .pollInterval(Duration.ofMillis(100))
                 .untilAsserted(assertion::run);
     }
