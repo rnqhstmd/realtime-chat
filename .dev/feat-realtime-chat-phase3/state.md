@@ -1,5 +1,5 @@
-phase: setup
-status: in_progress
+phase: complete
+status: completed
 vcs-type: git
 branch: feat/realtime-chat-phase3
 base: main
@@ -15,7 +15,11 @@ package-base: com.realtimechat
 started: 2026-05-30
 auto-stashed: false
 last-known-head: b25e8b70e5c8656eac694b5926b973636506346e
-current-step: "review 완료(QA Critical 0, ZT 합산·하드닝 4건 수정·재검증 green, qa 확인 통과), complete 진입"
+current-step: "완료 — PR #4 생성(https://github.com/rnqhstmd/realtime-chat/pull/4). 머지는 리뷰어 수행."
+acceptance: "product-owner ACCEPT — [Must] AC-1~11,14,15 + [Should] AC-12,13 충족. SessionDisconnectEvent 즉시 OFFLINE은 Phase 4 권장."
+pr: "https://github.com/rnqhstmd/realtime-chat/pull/4"
+status-md-updated: "FR-12, FR-13, FR-14 → ✅ (#4)"
+context-updated: "glossary(heartbeat/presence TTL/관측성 메트릭) + architecture(Realtime Gateway·REST API Phase 3 반영)"
 review-result:
   - "Mechanical Gate: build+test green(77/0)."
   - "QA: CERTAIN 0 / Warning 2 / QUESTION 3. AC-1~15 전부 테스트 커버."
@@ -63,7 +67,7 @@ phases:
   design: completed
   implement: completed
   review: completed
-  complete: in_progress
+  complete: completed
   implement: pending
   review: pending
   complete: pending
