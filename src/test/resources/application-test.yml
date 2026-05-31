@@ -1,3 +1,9 @@
+management:
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+
 spring:
   # datasource는 Testcontainers @ServiceConnection이 동적으로 주입한다(고정 url 미지정).
   flyway:
@@ -14,6 +20,11 @@ logging:
 # 테스트 튜닝: 비동기 파이프라인이 테스트 시간 내에 결정적으로 동작하도록 main의 chat.* 값을 오버라이드.
 # (기존 39개 통합 테스트도 이 프로파일을 공유하나, 아래 값은 멱등·비치명적이라 무해하다.)
 chat:
+  fanout:
+    mode: local                  # 테스트는 단일 인스턴스 local fanout으로 고정(Redis pub/sub 미사용).
+  presence:
+    ttl-seconds: 3               # presence TTL을 짧게(90→3)하여 만료/오프라인 전이를 테스트 시간 내 검증.
+    expiry-poll-ms: 500          # 만료 폴링 주기를 짧게(5000→500)하여 만료 감지 지연 단축.
   outbox:
     relay:
       poll-interval-ms: 100      # relay 폴링을 빠르게(500→100): outbox→stream 발행 지연 단축(AC-3).

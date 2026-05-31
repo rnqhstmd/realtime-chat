@@ -18,6 +18,7 @@ import jakarta.annotation.PostConstruct;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,6 +49,11 @@ public class CommandHandler {
     private static final Logger log = LoggerFactory.getLogger(CommandHandler.class);
 
     private static final String STATUS_ENDED = "ENDED";
+
+    /** 구조화 로그용 MDC 키(FR-P3-6, [Could]). 스레드 풀 재사용 누수 방지를 위해 finally에서 put한 키만 remove. */
+    private static final String MDC_SESSION_ID = "sessionId";
+    private static final String MDC_SEQ = "seq";
+    private static final String MDC_EVENT_TYPE = "eventType";
 
     /** PRESENCE_CHANGED에서 허용하는 presence 값(대문자 정규화 후 검증·저장). */
     private static final String PRESENCE_ONLINE = "ONLINE";
@@ -91,38 +97,51 @@ public class CommandHandler {
     @Transactional
     public StoredEvent handle(UUID sessionId, EventType type, JsonNode payload,
                               String idempotencyKey, UUID actorId) {
-        // (a) 멱등 키 검증: 공백 금지 + 최대 길이 제한(설계 가정 보강, 단일 소스 IdempotencyKeys)
-        IdempotencyKeys.require(idempotencyKey);
+        // 구조화 로그 컨텍스트(FR-P3-6, [Could]): 진입 시 sessionId/eventType put, seq는 채번 후 보강.
+        // finally에서 put한 키만 remove하여 호출자(상위) MDC 컨텍스트는 보존한다(MDC.clear() 회피).
+        MDC.put(MDC_SESSION_ID, sessionId.toString());
+        MDC.put(MDC_EVENT_TYPE, type.name());
+        try {
+            // (a) 멱등 키 검증: 공백 금지 + 최대 길이 제한(설계 가정 보강, 단일 소스 IdempotencyKeys)
+            IdempotencyKeys.require(idempotencyKey);
 
-        // (b) 세션 상태 검증: 없으면 404, 종료된 세션은 수집 불가(400)
-        String status = sessionDao.status(sessionId)
-                .orElseThrow(() -> new SessionNotFoundException(sessionId));
-        if (STATUS_ENDED.equals(status)) {
-            throw new InvalidEventException("Cannot collect events for ended session: " + sessionId);
-        }
-
-        // (c) 타입별 payload 검증·보강 → append에 전달할 최종 payload 확정
-        JsonNode finalPayload = validateAndEnrich(type, payload, actorId);
-
-        // (d) seq 채번 + 수집 멱등(§4.1 계층1)
-        AppendResult result =
-                eventStore.append(new AppendCommand(sessionId, type, finalPayload, idempotencyKey, actorId));
-        StoredEvent stored = result.event();
-
-        // 멱등 재유입(isNew=false)이면 projection·broadcast를 생략하고 기존 이벤트만 반환한다.
-        // 첫 처리 시 이미 projection·broadcast가 수행되었으므로 중복 적용/전달을 막는다(§4.1 계층2, §6).
-        if (result.isNew()) {
-            // (e) 동기 projection — 기본 비활성. syncProjectionEnabled=true일 때만 실행(테스트/디버깅 전용).
-            // Phase 2 비동기 파이프라인에서 projection은 EventListener가 담당하므로 운영 시 false 유지.
-            if (syncProjectionEnabled) {
-                projectionUpdater.apply(stored);
+            // (b) 세션 상태 검증: 없으면 404, 종료된 세션은 수집 불가(400)
+            String status = sessionDao.status(sessionId)
+                    .orElseThrow(() -> new SessionNotFoundException(sessionId));
+            if (STATUS_ENDED.equals(status)) {
+                throw new InvalidEventException("Cannot collect events for ended session: " + sessionId);
             }
 
-            // (f) 커밋 후 실시간 팬아웃(§6). 동기화 비활성 상황(테스트/배치)에서는 즉시 전송.
-            publishAfterCommit(sessionId, stored);
-        }
+            // (c) 타입별 payload 검증·보강 → append에 전달할 최종 payload 확정
+            JsonNode finalPayload = validateAndEnrich(type, payload, actorId);
 
-        return stored;
+            // (d) seq 채번 + 수집 멱등(§4.1 계층1)
+            AppendResult result =
+                    eventStore.append(new AppendCommand(sessionId, type, finalPayload, idempotencyKey, actorId));
+            StoredEvent stored = result.event();
+
+            // 채번된 seq를 로그 컨텍스트에 보강(이후 projection·broadcast 로그에 노출).
+            MDC.put(MDC_SEQ, Long.toString(stored.seq()));
+
+            // 멱등 재유입(isNew=false)이면 projection·broadcast를 생략하고 기존 이벤트만 반환한다.
+            // 첫 처리 시 이미 projection·broadcast가 수행되었으므로 중복 적용/전달을 막는다(§4.1 계층2, §6).
+            if (result.isNew()) {
+                // (e) 동기 projection — 기본 비활성. syncProjectionEnabled=true일 때만 실행(테스트/디버깅 전용).
+                // Phase 2 비동기 파이프라인에서 projection은 EventListener가 담당하므로 운영 시 false 유지.
+                if (syncProjectionEnabled) {
+                    projectionUpdater.apply(stored);
+                }
+
+                // (f) 커밋 후 실시간 팬아웃(§6). 동기화 비활성 상황(테스트/배치)에서는 즉시 전송.
+                publishAfterCommit(sessionId, stored);
+            }
+
+            return stored;
+        } finally {
+            MDC.remove(MDC_SESSION_ID);
+            MDC.remove(MDC_SEQ);
+            MDC.remove(MDC_EVENT_TYPE);
+        }
     }
 
     /**

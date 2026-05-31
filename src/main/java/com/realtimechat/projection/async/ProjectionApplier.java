@@ -11,6 +11,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -41,6 +42,11 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 public class ProjectionApplier {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectionApplier.class);
+
+    /** 구조화 로그용 MDC 키(FR-P3-6, [Could]). worker 스레드는 풀 재사용되므로 finally에서 반드시 remove(누수 방지). */
+    private static final String MDC_SESSION_ID = "sessionId";
+    private static final String MDC_SEQ = "seq";
+    private static final String MDC_EVENT_TYPE = "eventType";
 
     private final ProjectionOffsetDao offsetDao;
     private final ProjectionUpdater projectionUpdater;
@@ -83,64 +89,75 @@ public class ProjectionApplier {
     public void apply(StoredEvent incoming) {
         UUID sessionId = incoming.sessionId();
 
-        // (1) 단일 upsert로 행 잠금 획득과 현재 오프셋 조회를 원자적으로 수행(락 공백·왕복 제거).
-        ProjectionOffsetDao.Offset off = offsetDao.lockOrInit(sessionId);
-        long lastApplied = off.lastAppliedSeq();
+        // 구조화 로그 컨텍스트(FR-P3-6, [Could]): worker 스레드에서 처리 중인 이벤트 식별자를 put.
+        // worker 스레드 풀 재사용으로 다음 이벤트 로그에 이전 sessionId가 섞이지 않도록 finally에서 반드시 remove.
+        MDC.put(MDC_SESSION_ID, sessionId.toString());
+        MDC.put(MDC_SEQ, Long.toString(incoming.seq()));
+        MDC.put(MDC_EVENT_TYPE, incoming.type().name());
+        try {
+            // (1) 단일 upsert로 행 잠금 획득과 현재 오프셋 조회를 원자적으로 수행(락 공백·왕복 제거).
+            ProjectionOffsetDao.Offset off = offsetDao.lockOrInit(sessionId);
+            long lastApplied = off.lastAppliedSeq();
 
-        // (2) seq-guard 1차(BR-2): 이미 본 seq면 read model 미수정 no-op 정상 종료(호출자가 XACK).
-        //     lockOrInit이 행 잠금을 보유하므로 TX 종료 시 잠금이 해제된다(정상).
-        if (incoming.seq() <= lastApplied) {
-            return;
-        }
-
-        // (3) 적용 전 스냅샷 카운터(마지막 스냅샷 이후 잔여 건수). 항상 [0, triggerInterval) 범위.
-        long since0 = off.eventsSinceSnapshot();
-
-        // (4) 적용 범위 결정.
-        List<StoredEvent> events;
-        if (incoming.seq() == lastApplied + 1) {
-            // 정상 진행: 재조회 없이 incoming 1건만 적용.
-            events = List.of(incoming);
-        } else {
-            // gap(incoming.seq > lastApplied + 1): event store가 순서·완전성 권위(FR-P2-7).
-            // findBySeqRange는 (fromExclusive, toInclusive] 반개구간 + seq 오름차순이므로
-            // (lastApplied, incoming.seq] 범위 전체가 누락분 포함 순서대로 조회된다.
-            events = eventStore.findBySeqRange(sessionId, lastApplied, incoming.seq());
-        }
-
-        // (5) triggerInterval 가드: 0/음수면 스냅샷 비활성(모듈로 회피).
-        boolean snapshotEnabled = triggerInterval > 0;
-
-        // (6) 이벤트를 순서대로 적용하며 running 카운터로 N배수 도달 시점의 정확한 seq를 수집한다.
-        //     gap-fill로 다건을 일괄 적용해도 각 N배수 seq마다 스냅샷이 트리거되도록 한다(AC-9).
-        long running = since0;
-        List<Long> snapshotSeqs = new ArrayList<>();
-        for (StoredEvent event : events) {
-            projectionUpdater.apply(event);
-            // lag은 live(incoming) 이벤트에 대해서만 기록한다. gap-fill 보강분은 과거 이벤트라
-            // lag이 크게 잡혀 lastLag/maxLag을 왜곡하므로 제외한다(정상 경로는 events가 incoming
-            // 1건이라 동일 동작, gap-fill은 마지막 incoming만 기록).
-            if (event.seq() == incoming.seq()) {
-                lagMetrics.record(event.occurredAt(), Instant.now());
+            // (2) seq-guard 1차(BR-2): 이미 본 seq면 read model 미수정 no-op 정상 종료(호출자가 XACK).
+            //     lockOrInit이 행 잠금을 보유하므로 TX 종료 시 잠금이 해제된다(정상).
+            if (incoming.seq() <= lastApplied) {
+                return;
             }
-            running++;
-            if (snapshotEnabled && running % triggerInterval == 0) {
-                snapshotSeqs.add(event.seq());
+
+            // (3) 적용 전 스냅샷 카운터(마지막 스냅샷 이후 잔여 건수). 항상 [0, triggerInterval) 범위.
+            long since0 = off.eventsSinceSnapshot();
+
+            // (4) 적용 범위 결정.
+            List<StoredEvent> events;
+            if (incoming.seq() == lastApplied + 1) {
+                // 정상 진행: 재조회 없이 incoming 1건만 적용.
+                events = List.of(incoming);
+            } else {
+                // gap(incoming.seq > lastApplied + 1): event store가 순서·완전성 권위(FR-P2-7).
+                // findBySeqRange는 (fromExclusive, toInclusive] 반개구간 + seq 오름차순이므로
+                // (lastApplied, incoming.seq] 범위 전체가 누락분 포함 순서대로 조회된다.
+                events = eventStore.findBySeqRange(sessionId, lastApplied, incoming.seq());
             }
-        }
 
-        // (7) offset 갱신(절대값): last_applied_seq=incoming.seq, events_since_snapshot=마지막 스냅샷 이후 잔여.
-        long leftover = snapshotEnabled ? (running % triggerInterval) : 0L;
-        offsetDao.updateOffset(sessionId, incoming.seq(), leftover);
+            // (5) triggerInterval 가드: 0/음수면 스냅샷 비활성(모듈로 회피).
+            boolean snapshotEnabled = triggerInterval > 0;
 
-        // (8) 스냅샷 트리거(§11, FR-P2-8, Q3): 수집한 각 N배수 seq에 대해 afterCommit으로 createSnapshot 위임.
-        //
-        // Q3 일관성 근거: 카운터는 (7)에서 잔여값으로 절대 갱신되므로 스냅샷이 실패해도 다음 N건이 쌓이면
-        // 재트리거되며, createSnapshot은 같은 up_to_seq 재생성이 무해하므로(멱등 BR-5) 중복도 안전하다.
-        // 스냅샷 일시 누락은 복원 비용 상한의 일시 위반일 뿐 정확성에는 무손상(BR-6).
-        for (long seq : snapshotSeqs) {
-            final long upToSeq = seq;
-            triggerSnapshotAfterCommit(sessionId, upToSeq);
+            // (6) 이벤트를 순서대로 적용하며 running 카운터로 N배수 도달 시점의 정확한 seq를 수집한다.
+            //     gap-fill로 다건을 일괄 적용해도 각 N배수 seq마다 스냅샷이 트리거되도록 한다(AC-9).
+            long running = since0;
+            List<Long> snapshotSeqs = new ArrayList<>();
+            for (StoredEvent event : events) {
+                projectionUpdater.apply(event);
+                // lag은 live(incoming) 이벤트에 대해서만 기록한다. gap-fill 보강분은 과거 이벤트라
+                // lag이 크게 잡혀 lastLag/maxLag을 왜곡하므로 제외한다(정상 경로는 events가 incoming
+                // 1건이라 동일 동작, gap-fill은 마지막 incoming만 기록).
+                if (event.seq() == incoming.seq()) {
+                    lagMetrics.record(event.occurredAt(), Instant.now());
+                }
+                running++;
+                if (snapshotEnabled && running % triggerInterval == 0) {
+                    snapshotSeqs.add(event.seq());
+                }
+            }
+
+            // (7) offset 갱신(절대값): last_applied_seq=incoming.seq, events_since_snapshot=마지막 스냅샷 이후 잔여.
+            long leftover = snapshotEnabled ? (running % triggerInterval) : 0L;
+            offsetDao.updateOffset(sessionId, incoming.seq(), leftover);
+
+            // (8) 스냅샷 트리거(§11, FR-P2-8, Q3): 수집한 각 N배수 seq에 대해 afterCommit으로 createSnapshot 위임.
+            //
+            // Q3 일관성 근거: 카운터는 (7)에서 잔여값으로 절대 갱신되므로 스냅샷이 실패해도 다음 N건이 쌓이면
+            // 재트리거되며, createSnapshot은 같은 up_to_seq 재생성이 무해하므로(멱등 BR-5) 중복도 안전하다.
+            // 스냅샷 일시 누락은 복원 비용 상한의 일시 위반일 뿐 정확성에는 무손상(BR-6).
+            for (long seq : snapshotSeqs) {
+                final long upToSeq = seq;
+                triggerSnapshotAfterCommit(sessionId, upToSeq);
+            }
+        } finally {
+            MDC.remove(MDC_SESSION_ID);
+            MDC.remove(MDC_SEQ);
+            MDC.remove(MDC_EVENT_TYPE);
         }
     }
 

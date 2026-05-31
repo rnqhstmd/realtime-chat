@@ -1,0 +1,2012 @@
+diff --git a/.gitignore b/.gitignore
+index 20a4893..031d7f3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,4 @@ build/
+ *.iml
+ .vscode/
+ .DS_Store
++.research/
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 7677eb0..240196f 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -23,6 +23,8 @@ dependencies {
+     implementation("org.springframework.boot:spring-boot-starter-jdbc")
+     implementation("org.springframework.boot:spring-boot-starter-validation")
+     implementation("org.springframework.boot:spring-boot-starter-data-redis")
++    implementation("org.springframework.boot:spring-boot-starter-actuator")
++    implementation("io.micrometer:micrometer-registry-prometheus")
+     implementation("org.flywaydb:flyway-core")
+     implementation("org.flywaydb:flyway-database-postgresql")
+ 
+diff --git a/src/main/java/com/realtimechat/async/RedisConfig.java b/src/main/java/com/realtimechat/async/RedisConfig.java
+index a3a6af0..8c2c827 100644
+--- a/src/main/java/com/realtimechat/async/RedisConfig.java
++++ b/src/main/java/com/realtimechat/async/RedisConfig.java
+@@ -1,15 +1,22 @@
+ package com.realtimechat.async;
+ 
++import com.realtimechat.realtime.FanoutProps;
++import com.realtimechat.realtime.SessionFanoutListener;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.data.redis.connection.RedisConnectionFactory;
+ import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.data.redis.listener.PatternTopic;
++import org.springframework.data.redis.listener.RedisMessageListenerContainer;
+ 
+ /**
+- * Redis Bean 설정(설계서 §4, §9).
++ * Redis Bean 설정(설계서 §4, §9, §5-A).
+  *
+  * <p>Stream 연산(XADD/XREADGROUP)에 {@link StringRedisTemplate}을 사용한다.
+  * Lettuce 자동구성된 {@link RedisConnectionFactory}를 주입받아 단순 위임한다.
++ *
++ * <p>{@code chat.fanout.mode=redis}일 때만 팬아웃 구독 컨테이너를 등록한다(설계서 §2-A, §5-A).
+  */
+ @Configuration
+ public class RedisConfig {
+@@ -18,4 +25,23 @@ public class RedisConfig {
+     public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory cf) {
+         return new StringRedisTemplate(cf);
+     }
++
++    /**
++     * 팬아웃 채널({@code chat.fanout.*}) 구독 컨테이너(설계서 §5-A) — redis 모드만.
++     *
++     * <p>{@code PatternTopic(channelPrefix + "*")} 단일 구독으로 모든 세션 채널을 받는다.
++     * BR-1 세션 격리는 채널명 sessionId로 자연 보장되며, {@link StringRedisTemplate}와 동일한
++     * {@link RedisConnectionFactory}를 공유한다.
++     */
++    @Bean
++    @ConditionalOnProperty(name = "chat.fanout.mode", havingValue = "redis")
++    RedisMessageListenerContainer fanoutContainer(
++            RedisConnectionFactory connectionFactory,
++            SessionFanoutListener listener,
++            FanoutProps props) {
++        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
++        container.setConnectionFactory(connectionFactory);
++        container.addMessageListener(listener, new PatternTopic(props.channelPrefix() + "*"));
++        return container;
++    }
+ }
+diff --git a/src/main/java/com/realtimechat/command/CommandHandler.java b/src/main/java/com/realtimechat/command/CommandHandler.java
+index febcb0d..b49bcb7 100644
+--- a/src/main/java/com/realtimechat/command/CommandHandler.java
++++ b/src/main/java/com/realtimechat/command/CommandHandler.java
+@@ -18,6 +18,7 @@ import jakarta.annotation.PostConstruct;
+ import java.util.UUID;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.slf4j.MDC;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+@@ -49,6 +50,11 @@ public class CommandHandler {
+ 
+     private static final String STATUS_ENDED = "ENDED";
+ 
++    /** 구조화 로그용 MDC 키(FR-P3-6, [Could]). 스레드 풀 재사용 누수 방지를 위해 finally에서 put한 키만 remove. */
++    private static final String MDC_SESSION_ID = "sessionId";
++    private static final String MDC_SEQ = "seq";
++    private static final String MDC_EVENT_TYPE = "eventType";
++
+     /** PRESENCE_CHANGED에서 허용하는 presence 값(대문자 정규화 후 검증·저장). */
+     private static final String PRESENCE_ONLINE = "ONLINE";
+     private static final String PRESENCE_OFFLINE = "OFFLINE";
+@@ -91,38 +97,51 @@ public class CommandHandler {
+     @Transactional
+     public StoredEvent handle(UUID sessionId, EventType type, JsonNode payload,
+                               String idempotencyKey, UUID actorId) {
+-        // (a) 멱등 키 검증: 공백 금지 + 최대 길이 제한(설계 가정 보강, 단일 소스 IdempotencyKeys)
+-        IdempotencyKeys.require(idempotencyKey);
+-
+-        // (b) 세션 상태 검증: 없으면 404, 종료된 세션은 수집 불가(400)
+-        String status = sessionDao.status(sessionId)
+-                .orElseThrow(() -> new SessionNotFoundException(sessionId));
+-        if (STATUS_ENDED.equals(status)) {
+-            throw new InvalidEventException("Cannot collect events for ended session: " + sessionId);
+-        }
++        // 구조화 로그 컨텍스트(FR-P3-6, [Could]): 진입 시 sessionId/eventType put, seq는 채번 후 보강.
++        // finally에서 put한 키만 remove하여 호출자(상위) MDC 컨텍스트는 보존한다(MDC.clear() 회피).
++        MDC.put(MDC_SESSION_ID, sessionId.toString());
++        MDC.put(MDC_EVENT_TYPE, type.name());
++        try {
++            // (a) 멱등 키 검증: 공백 금지 + 최대 길이 제한(설계 가정 보강, 단일 소스 IdempotencyKeys)
++            IdempotencyKeys.require(idempotencyKey);
+ 
+-        // (c) 타입별 payload 검증·보강 → append에 전달할 최종 payload 확정
+-        JsonNode finalPayload = validateAndEnrich(type, payload, actorId);
+-
+-        // (d) seq 채번 + 수집 멱등(§4.1 계층1)
+-        AppendResult result =
+-                eventStore.append(new AppendCommand(sessionId, type, finalPayload, idempotencyKey, actorId));
+-        StoredEvent stored = result.event();
+-
+-        // 멱등 재유입(isNew=false)이면 projection·broadcast를 생략하고 기존 이벤트만 반환한다.
+-        // 첫 처리 시 이미 projection·broadcast가 수행되었으므로 중복 적용/전달을 막는다(§4.1 계층2, §6).
+-        if (result.isNew()) {
+-            // (e) 동기 projection — 기본 비활성. syncProjectionEnabled=true일 때만 실행(테스트/디버깅 전용).
+-            // Phase 2 비동기 파이프라인에서 projection은 EventListener가 담당하므로 운영 시 false 유지.
+-            if (syncProjectionEnabled) {
+-                projectionUpdater.apply(stored);
++            // (b) 세션 상태 검증: 없으면 404, 종료된 세션은 수집 불가(400)
++            String status = sessionDao.status(sessionId)
++                    .orElseThrow(() -> new SessionNotFoundException(sessionId));
++            if (STATUS_ENDED.equals(status)) {
++                throw new InvalidEventException("Cannot collect events for ended session: " + sessionId);
+             }
+ 
+-            // (f) 커밋 후 실시간 팬아웃(§6). 동기화 비활성 상황(테스트/배치)에서는 즉시 전송.
+-            publishAfterCommit(sessionId, stored);
+-        }
++            // (c) 타입별 payload 검증·보강 → append에 전달할 최종 payload 확정
++            JsonNode finalPayload = validateAndEnrich(type, payload, actorId);
++
++            // (d) seq 채번 + 수집 멱등(§4.1 계층1)
++            AppendResult result =
++                    eventStore.append(new AppendCommand(sessionId, type, finalPayload, idempotencyKey, actorId));
++            StoredEvent stored = result.event();
++
++            // 채번된 seq를 로그 컨텍스트에 보강(이후 projection·broadcast 로그에 노출).
++            MDC.put(MDC_SEQ, Long.toString(stored.seq()));
+ 
+-        return stored;
++            // 멱등 재유입(isNew=false)이면 projection·broadcast를 생략하고 기존 이벤트만 반환한다.
++            // 첫 처리 시 이미 projection·broadcast가 수행되었으므로 중복 적용/전달을 막는다(§4.1 계층2, §6).
++            if (result.isNew()) {
++                // (e) 동기 projection — 기본 비활성. syncProjectionEnabled=true일 때만 실행(테스트/디버깅 전용).
++                // Phase 2 비동기 파이프라인에서 projection은 EventListener가 담당하므로 운영 시 false 유지.
++                if (syncProjectionEnabled) {
++                    projectionUpdater.apply(stored);
++                }
++
++                // (f) 커밋 후 실시간 팬아웃(§6). 동기화 비활성 상황(테스트/배치)에서는 즉시 전송.
++                publishAfterCommit(sessionId, stored);
++            }
++
++            return stored;
++        } finally {
++            MDC.remove(MDC_SESSION_ID);
++            MDC.remove(MDC_SEQ);
++            MDC.remove(MDC_EVENT_TYPE);
++        }
+     }
+ 
+     /**
+diff --git a/src/main/java/com/realtimechat/common/web/ApiExceptionHandler.java b/src/main/java/com/realtimechat/common/web/ApiExceptionHandler.java
+index cfc51bb..cae138b 100644
+--- a/src/main/java/com/realtimechat/common/web/ApiExceptionHandler.java
++++ b/src/main/java/com/realtimechat/common/web/ApiExceptionHandler.java
+@@ -14,6 +14,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
+ import org.springframework.web.bind.MissingRequestHeaderException;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+ import org.springframework.web.bind.annotation.RestControllerAdvice;
++import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+ 
+ /**
+  * 전역 예외 → HTTP 응답 매핑.
+@@ -49,6 +50,15 @@ public class ApiExceptionHandler {
+         return build(HttpStatus.BAD_REQUEST, "Missing required header: " + e.getHeaderName());
+     }
+ 
++    /**
++     * 요청 파라미터 타입 불일치(예: {@code limit}에 숫자가 아닌 값) → 400. 클라이언트 요청 결함이므로
++     * 400으로 매핑한다. 미처리 시 catch-all로 500이 되어 클라이언트 오류가 서버 오류로 잘못 표기되는 것을 방지한다.
++     */
++    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
++    public ResponseEntity<Map<String, Object>> handleTypeMismatch(MethodArgumentTypeMismatchException e) {
++        return build(HttpStatus.BAD_REQUEST, "Invalid parameter '" + e.getName() + "': " + e.getValue());
++    }
++
+     @ExceptionHandler(SessionNotFoundException.class)
+     public ResponseEntity<Map<String, Object>> handleSessionNotFound(SessionNotFoundException e) {
+         return build(HttpStatus.NOT_FOUND, e.getMessage());
+diff --git a/src/main/java/com/realtimechat/common/web/LimitSupport.java b/src/main/java/com/realtimechat/common/web/LimitSupport.java
+new file mode 100644
+index 0000000..a9c8017
+--- /dev/null
++++ b/src/main/java/com/realtimechat/common/web/LimitSupport.java
+@@ -0,0 +1,30 @@
++package com.realtimechat.common.web;
++
++import com.realtimechat.common.error.InvalidEventException;
++
++/**
++ * limit 파라미터 공용 검증 유틸. 기존 {@code QueryController}의 검증 로직을 추출해 여러
++ * 컨트롤러가 동일 규칙(1~{@value #MAX_LIMIT})을 공유하도록 한다(설계서 §5-C).
++ *
++ * <p>상한·예외·메시지는 기존 동작과 동일하게 유지한다(회귀 방지).
++ */
++public final class LimitSupport {
++
++    /** limit 파라미터 상한(RISK 보강). 과도한 N으로 인한 메모리/응답 비대화를 막는다. */
++    public static final int MAX_LIMIT = 500;
++
++    private LimitSupport() {
++    }
++
++    /**
++     * limit 범위 검증(1~{@value #MAX_LIMIT}). 범위 밖이면 {@link InvalidEventException}(400).
++     * 미지정 기본값은 호출부에서 결정하므로 여기서는 명시된 값만 검증한다.
++     */
++    public static int validate(int limit) {
++        if (limit < 1 || limit > MAX_LIMIT) {
++            throw new InvalidEventException(
++                    "Invalid 'limit': must be between 1 and " + MAX_LIMIT + ", got: " + limit);
++        }
++        return limit;
++    }
++}
+diff --git a/src/main/java/com/realtimechat/outbox/OutboxRelay.java b/src/main/java/com/realtimechat/outbox/OutboxRelay.java
+index 51c1ce6..9fb4a1c 100644
+--- a/src/main/java/com/realtimechat/outbox/OutboxRelay.java
++++ b/src/main/java/com/realtimechat/outbox/OutboxRelay.java
+@@ -3,6 +3,7 @@ package com.realtimechat.outbox;
+ import com.realtimechat.async.EventStreamCodec;
+ import com.realtimechat.async.StreamProps;
+ import com.realtimechat.event.StoredEvent;
++import com.realtimechat.projection.async.ProjectionLagMetrics;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Value;
+@@ -35,6 +36,7 @@ public class OutboxRelay {
+     private final EventStreamCodec codec;
+     private final StreamProps props;
+     private final StringRedisTemplate stringRedisTemplate;
++    private final ProjectionLagMetrics metrics;
+ 
+     @Value("${chat.outbox.relay.batch-size:100}")
+     private int batchSize;
+@@ -42,11 +44,13 @@ public class OutboxRelay {
+     public OutboxRelay(OutboxDao outboxDao,
+                        EventStreamCodec codec,
+                        StreamProps props,
+-                       StringRedisTemplate stringRedisTemplate) {
++                       StringRedisTemplate stringRedisTemplate,
++                       ProjectionLagMetrics metrics) {
+         this.outboxDao = outboxDao;
+         this.codec = codec;
+         this.props = props;
+         this.stringRedisTemplate = stringRedisTemplate;
++        this.metrics = metrics;
+     }
+ 
+     /**
+@@ -80,6 +84,8 @@ public class OutboxRelay {
+ 
+         if (!successIds.isEmpty()) {
+             outboxDao.markPublished(successIds);
++            // 발행 성공 레코드 수만큼 처리량 카운트(FR-P3-4). 0건이면 호출 생략.
++            metrics.recordOutboxRelayed(successIds.size());
+         }
+ 
+         try {
+diff --git a/src/main/java/com/realtimechat/presence/PresenceController.java b/src/main/java/com/realtimechat/presence/PresenceController.java
+new file mode 100644
+index 0000000..a37f754
+--- /dev/null
++++ b/src/main/java/com/realtimechat/presence/PresenceController.java
+@@ -0,0 +1,96 @@
++package com.realtimechat.presence;
++
++import com.realtimechat.common.error.SessionNotFoundException;
++import com.realtimechat.session.SessionDao;
++import jakarta.validation.Valid;
++import jakarta.validation.constraints.NotNull;
++import java.util.UUID;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
++import org.springframework.messaging.handler.annotation.DestinationVariable;
++import org.springframework.messaging.handler.annotation.MessageMapping;
++import org.springframework.stereotype.Controller;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.ResponseBody;
++
++/**
++ * heartbeat ping 수신(설계서 §5-B, FR-P3-2).
++ *
++ * <p>heartbeat는 <b>이벤트가 아닌 경량 ping</b>이다(PRD deviation, 결정 A). 따라서
++ * {@link com.realtimechat.command.CommandHandler}/append/broadcast를 경유하지 않고
++ * {@link PresenceTracker#touch}로 Redis liveness 키 TTL만 갱신한다. heartbeat를 이벤트화하면
++ * 30s마다 참여자 수만큼 event/outbox/stream/팬아웃이 돌고 last_seq 폭증·resume delta 오염이
++ * 발생하므로(critic #2/#3), 의도적으로 수집 경로에서 분리한다.
++ *
++ * <p>REST({@code POST /sessions/{id}/heartbeat})와 STOMP({@code /app/session/{id}/heartbeat})
++ * 두 경로 모두 동일한 {@link PresenceTracker#touch}만 호출한다.
++ */
++@Controller
++public class PresenceController {
++
++    private static final Logger log = LoggerFactory.getLogger(PresenceController.class);
++
++    private final PresenceTracker presenceTracker;
++    private final SessionDao sessionDao;
++
++    public PresenceController(PresenceTracker presenceTracker, SessionDao sessionDao) {
++        this.presenceTracker = presenceTracker;
++        this.sessionDao = sessionDao;
++    }
++
++    /**
++     * heartbeat ping(REST, 설계서 §5-B). 세션 미존재면 404, 그 외에는 liveness 키 TTL을 갱신하고
++     * {@code 204 No Content}를 반환한다. 멱등 키·append·broadcast 없이 {@code touch}만 수행한다.
++     *
++     * @param id      대상 세션
++     * @param request 참여자 식별자만 담는 heartbeat 본문(멱등 키 불요 — 이벤트가 아니므로)
++     */
++    @PostMapping("/sessions/{id}/heartbeat")
++    @ResponseBody
++    public ResponseEntity<Void> heartbeat(@PathVariable UUID id, @Valid @RequestBody HeartbeatRequest request) {
++        if (sessionDao.status(id).isEmpty()) {
++            throw new SessionNotFoundException(id);
++        }
++        presenceTracker.touch(id, request.participantId());
++        return ResponseEntity.status(HttpStatus.NO_CONTENT).build();
++    }
++
++    /**
++     * heartbeat ping(STOMP, 설계서 §5-B). {@link StompEventController} 수집 패턴과 동일하게
++     * {@code @MessageMapping} + {@code @DestinationVariable}을 사용하되, 이벤트가 아니므로
++     * CommandHandler를 경유하지 않고 {@code touch}만 한다. 응답 없음(ping).
++     *
++     * @param sessionId 대상 세션({@code @DestinationVariable})
++     * @param msg       참여자 식별자만 담는 heartbeat 본문
++     */
++    @MessageMapping("/session/{sessionId}/heartbeat")
++    public void heartbeatOverStomp(@DestinationVariable UUID sessionId, HeartbeatRequest msg) {
++        // @MessageMapping은 Bean Validation을 자동 적용하지 않아 @NotNull이 강제되지 않는다.
++        // null이면 touch에서 NPE/`presence:{sid}:null` 키가 되므로 touch 없이 무시한다.
++        if (msg == null || msg.participantId() == null) {
++            log.warn("STOMP heartbeat: participantId 누락 무시 sessionId={}", sessionId);
++            return;
++        }
++        // REST heartbeat와 일관되게 미존재 세션은 무시한다. STOMP는 HTTP 응답이 없으므로
++        // 404 대신 silent ignore + 로그로 처리한다.
++        if (sessionDao.status(sessionId).isEmpty()) {
++            log.warn("STOMP heartbeat: 미존재 세션 무시 sessionId={}", sessionId);
++            return;
++        }
++        presenceTracker.touch(sessionId, msg.participantId());
++    }
++
++    /**
++     * heartbeat ping 본문(설계서 §5-B). heartbeat는 이벤트가 아니므로 멱등 키 없이 참여자
++     * 식별자만 담는다(join 요청의 {@code JoinRequest}와 동일한 형태).
++     *
++     * @param participantId 참여자 식별자(필수)
++     */
++    public record HeartbeatRequest(
++            @NotNull UUID participantId) {
++    }
++}
+diff --git a/src/main/java/com/realtimechat/presence/PresenceProps.java b/src/main/java/com/realtimechat/presence/PresenceProps.java
+new file mode 100644
+index 0000000..a81d519
+--- /dev/null
++++ b/src/main/java/com/realtimechat/presence/PresenceProps.java
+@@ -0,0 +1,30 @@
++package com.realtimechat.presence;
++
++import org.springframework.boot.context.properties.ConfigurationProperties;
++
++/**
++ * {@code chat.presence.*} 설정 바인딩(설계서 §5-B, §7).
++ *
++ * <p>Spring Boot 3.x 생성자 바인딩(record)을 사용한다. relaxed binding 으로
++ * {@code ttl-seconds} → {@code ttlSeconds},
++ * {@code heartbeat-interval-seconds} → {@code heartbeatIntervalSeconds},
++ * {@code expiry-poll-ms} → {@code expiryPollMs} 가 자동 매핑된다.
++ *
++ * <ul>
++ *   <li>{@code ttlSeconds}: liveness 키 TTL(기본 90). heartbeat ping마다 SETEX로 갱신.</li>
++ *   <li>{@code heartbeatIntervalSeconds}: 클라이언트 ping 주기 가이드(기본 30, 서버는 touch만).</li>
++ *   <li>{@code expiryPollMs}: PresenceSweeper 폴링 주기(기본 5000).</li>
++ * </ul>
++ */
++@ConfigurationProperties(prefix = "chat.presence")
++public record PresenceProps(
++        long ttlSeconds,
++        int heartbeatIntervalSeconds,
++        long expiryPollMs) {
++
++    public PresenceProps {
++        if (ttlSeconds <= 0)                 ttlSeconds = 90L;
++        if (heartbeatIntervalSeconds <= 0)   heartbeatIntervalSeconds = 30;
++        if (expiryPollMs <= 0)               expiryPollMs = 5_000L;
++    }
++}
+diff --git a/src/main/java/com/realtimechat/presence/PresenceSweeper.java b/src/main/java/com/realtimechat/presence/PresenceSweeper.java
+new file mode 100644
+index 0000000..7a97826
+--- /dev/null
++++ b/src/main/java/com/realtimechat/presence/PresenceSweeper.java
+@@ -0,0 +1,85 @@
++package com.realtimechat.presence;
++
++import com.fasterxml.jackson.databind.node.ObjectNode;
++import com.realtimechat.command.CommandHandler;
++import com.realtimechat.common.error.InvalidEventException;
++import com.realtimechat.common.json.JsonUtil;
++import com.realtimechat.event.EventType;
++import java.time.Instant;
++import java.util.UUID;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++/**
++ * presence TTL 만료 감지 + OFFLINE 자동 수집(설계서 §5-B, FR-P3-2, BR-2, BR-3, AC-4/5).
++ *
++ * <p>{@code expiry-poll-ms}(기본 5s) 주기로 sweep 대상 Set의 모든 멤버를 훑어 liveness 키가
++ * 만료된 멤버를 찾는다. 만료 멤버는 {@link PresenceTracker#claimExpired}(SREM 원자)로 1회만
++ * "선점"하고, 선점에 성공한 sweep만 PRESENCE_CHANGED(OFFLINE)를 발행한다. OFFLINE 중복 방지의
++ * 권위는 전적으로 SREM 반환값이며 read model lag와 무관하다(BR-3, critic #1).
++ *
++ * <p>OFFLINE 발행은 일반 이벤트와 동일하게 기존 {@link CommandHandler#handle}로 수집되어
++ * projection·팬아웃을 거친다(CommandHandler 수정 0, 설계서 §5-B). heartbeat ping은 이벤트가
++ * 아니므로 이 경로와 무관하다.
++ *
++ * <p>{@code @Transactional} 없음: OFFLINE 발행의 TX 경계는 {@link CommandHandler#handle} 내부에
++ * 있다. 백그라운드 스케줄이므로 멤버 처리 중 예외는 WARN으로 흡수하고 다음 멤버/다음 주기로
++ * 진행한다(sweep 중단 방지).
++ */
++@Component
++public class PresenceSweeper {
++
++    private static final Logger log = LoggerFactory.getLogger(PresenceSweeper.class);
++
++    private static final String PRESENCE_OFFLINE = "OFFLINE";
++
++    private final PresenceTracker tracker;
++    private final CommandHandler commandHandler;
++
++    public PresenceSweeper(PresenceTracker tracker, CommandHandler commandHandler) {
++        this.tracker = tracker;
++        this.commandHandler = commandHandler;
++    }
++
++    /**
++     * 만료 멤버를 훑어 OFFLINE을 1회 발행한다(설계서 §5-B). liveness 키가 만료된
++     * 멤버만 {@link PresenceTracker#claimExpired}로 선점하고, 선점에 성공한 호출만 발행한다.
++     */
++    @Scheduled(fixedDelayString = "${chat.presence.expiry-poll-ms:5000}")
++    public void sweep() {
++        for (String member : tracker.trackedMembers()) {
++            try {
++                UUID sid = PresenceTracker.sessionIdOf(member);
++                UUID pid = PresenceTracker.participantIdOf(member);
++                if (!tracker.isAlive(sid, pid)) {            // liveness 키 만료
++                    if (tracker.claimExpired(member)) {      // SREM==1: 자기만 발행(BR-3)
++                        publishOffline(sid, pid);
++                    }
++                }
++            } catch (RuntimeException e) {
++                log.warn("presence sweep 처리 실패: member={}", member, e);  // sweep 중단 방지
++            }
++        }
++    }
++
++    /**
++     * PRESENCE_CHANGED(OFFLINE)를 기존 수집 경로로 발행한다(설계서 §5-B). 멱등 키는 SREM이 1회
++     * 보장하므로 단조요소(epoch-milli)로 충분하다. ENDED 세션 등으로 수집이 거부되면
++     * ({@link InvalidEventException}) skip하고 WARN만 남긴다.
++     */
++    private void publishOffline(UUID sid, UUID pid) {
++        try {
++            ObjectNode payload = JsonUtil.mapper().createObjectNode()
++                    .put("participantId", pid.toString())
++                    .put("presence", PRESENCE_OFFLINE);
++            String idem = "presence-offline-" + sid + "-" + pid + "-" + Instant.now().toEpochMilli();
++            commandHandler.handle(sid, EventType.PRESENCE_CHANGED, payload, idem, pid);  // 정상 수집 경로
++        } catch (InvalidEventException e) {                  // ENDED 세션 등
++            log.warn("OFFLINE 발행 skip(세션 비활성): sid={}, pid={}", sid, pid, e);
++        } catch (RuntimeException e) {                       // sweep 중단 방지
++            log.warn("OFFLINE 발행 실패: sid={}, pid={}", sid, pid, e);
++        }
++    }
++}
+diff --git a/src/main/java/com/realtimechat/presence/PresenceTracker.java b/src/main/java/com/realtimechat/presence/PresenceTracker.java
+new file mode 100644
+index 0000000..f52acd9
+--- /dev/null
++++ b/src/main/java/com/realtimechat/presence/PresenceTracker.java
+@@ -0,0 +1,87 @@
++package com.realtimechat.presence;
++
++import java.time.Duration;
++import java.util.Set;
++import java.util.UUID;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.stereotype.Component;
++
++/**
++ * presence liveness 추적(설계서 §5-B, FR-P3-2, BR-2, BR-3).
++ *
++ * <p>presence의 권위는 <b>Redis 키 존재 여부(liveness)</b>이며 read model이 아니다.
++ * heartbeat는 이벤트가 아닌 경량 ping으로 {@link #touch}만 수행한다(SETEX + SADD).
++ *
++ * <p>키 스키마:
++ * <ul>
++ *   <li>liveness 키: {@code presence:{sessionId}:{participantId}}, TTL = {@code ttlSeconds}, 값=epoch-milli(디버그용).</li>
++ *   <li>sweep 대상 Set: {@link #TRACKED_SET}, 멤버 = {@code {sessionId}:{participantId}}(TTL 없음, OFFLINE 처리 시 SREM 제거).</li>
++ * </ul>
++ *
++ * <p><b>BR-3 중복 방지</b>: OFFLINE 발행 가드는 전적으로 {@link #claimExpired}의 SREM 원자 반환값으로 보장한다.
++ * 반환값이 1이면 이 호출이 멤버 제거에 성공한 유일 주체이므로 그 주체만 OFFLINE을 발행한다(read model lag 무관).
++ *
++ * <p>{@code @Transactional} 없음: 호출자 TX 가정이며 Redis 연산은 TX와 무관하다.
++ */
++@Component
++public class PresenceTracker {
++
++    /** sweep 대상 멤버 집합(Redis Set) 키. 멤버 = {@code {sessionId}:{participantId}}. */
++    public static final String TRACKED_SET = "presence:tracked";
++
++    private final StringRedisTemplate redis;
++    private final PresenceProps props;
++
++    public PresenceTracker(StringRedisTemplate redis, PresenceProps props) {
++        this.redis = redis;
++        this.props = props;
++    }
++
++    /**
++     * heartbeat ping 수신 시 liveness 갱신: SETEX로 TTL을 재설정하고 sweep 대상 Set에 등록(멱등).
++     */
++    public void touch(UUID sessionId, UUID participantId) {
++        String key = presenceKey(sessionId, participantId);
++        redis.opsForValue().set(key, Long.toString(System.currentTimeMillis()),
++                Duration.ofSeconds(props.ttlSeconds()));
++        redis.opsForSet().add(TRACKED_SET, member(sessionId, participantId));
++    }
++
++    /** liveness 키 존재 여부(EXISTS). 만료되었으면 false. */
++    public boolean isAlive(UUID sessionId, UUID participantId) {
++        return Boolean.TRUE.equals(redis.hasKey(presenceKey(sessionId, participantId)));
++    }
++
++    /** sweep 대상 멤버 전체(SMEMBERS). null 안전. */
++    public Set<String> trackedMembers() {
++        Set<String> members = redis.opsForSet().members(TRACKED_SET);
++        return members == null ? Set.of() : members;
++    }
++
++    /**
++     * BR-3 핵심: sweep 대상 Set에서 멤버를 원자적으로 제거(SREM)하고, 이 호출이 제거에 성공한 유일
++     * 주체인지(반환값 1) 반환한다. 동시 sweep/disconnect 경쟁도 SREM 원자성으로 1회 수렴한다.
++     */
++    public boolean claimExpired(String member) {
++        Long removed = redis.opsForSet().remove(TRACKED_SET, member);
++        return removed != null && removed == 1L;
++    }
++
++    /** 멤버 문자열에서 sessionId 파싱(PresenceSweeper 사용). */
++    public static UUID sessionIdOf(String member) {
++        return UUID.fromString(member.substring(0, member.indexOf(':')));
++    }
++
++    /** 멤버 문자열에서 participantId 파싱(PresenceSweeper 사용). */
++    public static UUID participantIdOf(String member) {
++        return UUID.fromString(member.substring(member.indexOf(':') + 1));
++    }
++
++    private static String presenceKey(UUID sessionId, UUID participantId) {
++        return "presence:" + sessionId + ":" + participantId;
++    }
++
++    private static String member(UUID sessionId, UUID participantId) {
++        return sessionId + ":" + participantId;
++    }
++}
+diff --git a/src/main/java/com/realtimechat/projection/async/ProjectionApplier.java b/src/main/java/com/realtimechat/projection/async/ProjectionApplier.java
+index 611a1b6..fc7d90d 100644
+--- a/src/main/java/com/realtimechat/projection/async/ProjectionApplier.java
++++ b/src/main/java/com/realtimechat/projection/async/ProjectionApplier.java
+@@ -11,6 +11,7 @@ import java.util.UUID;
+ import java.util.concurrent.ExecutorService;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.slf4j.MDC;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+@@ -42,6 +43,11 @@ public class ProjectionApplier {
+ 
+     private static final Logger log = LoggerFactory.getLogger(ProjectionApplier.class);
+ 
++    /** 구조화 로그용 MDC 키(FR-P3-6, [Could]). worker 스레드는 풀 재사용되므로 finally에서 반드시 remove(누수 방지). */
++    private static final String MDC_SESSION_ID = "sessionId";
++    private static final String MDC_SEQ = "seq";
++    private static final String MDC_EVENT_TYPE = "eventType";
++
+     private final ProjectionOffsetDao offsetDao;
+     private final ProjectionUpdater projectionUpdater;
+     private final EventStore eventStore;
+@@ -83,64 +89,75 @@ public class ProjectionApplier {
+     public void apply(StoredEvent incoming) {
+         UUID sessionId = incoming.sessionId();
+ 
+-        // (1) 단일 upsert로 행 잠금 획득과 현재 오프셋 조회를 원자적으로 수행(락 공백·왕복 제거).
+-        ProjectionOffsetDao.Offset off = offsetDao.lockOrInit(sessionId);
+-        long lastApplied = off.lastAppliedSeq();
+-
+-        // (2) seq-guard 1차(BR-2): 이미 본 seq면 read model 미수정 no-op 정상 종료(호출자가 XACK).
+-        //     lockOrInit이 행 잠금을 보유하므로 TX 종료 시 잠금이 해제된다(정상).
+-        if (incoming.seq() <= lastApplied) {
+-            return;
+-        }
+-
+-        // (3) 적용 전 스냅샷 카운터(마지막 스냅샷 이후 잔여 건수). 항상 [0, triggerInterval) 범위.
+-        long since0 = off.eventsSinceSnapshot();
+-
+-        // (4) 적용 범위 결정.
+-        List<StoredEvent> events;
+-        if (incoming.seq() == lastApplied + 1) {
+-            // 정상 진행: 재조회 없이 incoming 1건만 적용.
+-            events = List.of(incoming);
+-        } else {
+-            // gap(incoming.seq > lastApplied + 1): event store가 순서·완전성 권위(FR-P2-7).
+-            // findBySeqRange는 (fromExclusive, toInclusive] 반개구간 + seq 오름차순이므로
+-            // (lastApplied, incoming.seq] 범위 전체가 누락분 포함 순서대로 조회된다.
+-            events = eventStore.findBySeqRange(sessionId, lastApplied, incoming.seq());
+-        }
++        // 구조화 로그 컨텍스트(FR-P3-6, [Could]): worker 스레드에서 처리 중인 이벤트 식별자를 put.
++        // worker 스레드 풀 재사용으로 다음 이벤트 로그에 이전 sessionId가 섞이지 않도록 finally에서 반드시 remove.
++        MDC.put(MDC_SESSION_ID, sessionId.toString());
++        MDC.put(MDC_SEQ, Long.toString(incoming.seq()));
++        MDC.put(MDC_EVENT_TYPE, incoming.type().name());
++        try {
++            // (1) 단일 upsert로 행 잠금 획득과 현재 오프셋 조회를 원자적으로 수행(락 공백·왕복 제거).
++            ProjectionOffsetDao.Offset off = offsetDao.lockOrInit(sessionId);
++            long lastApplied = off.lastAppliedSeq();
++
++            // (2) seq-guard 1차(BR-2): 이미 본 seq면 read model 미수정 no-op 정상 종료(호출자가 XACK).
++            //     lockOrInit이 행 잠금을 보유하므로 TX 종료 시 잠금이 해제된다(정상).
++            if (incoming.seq() <= lastApplied) {
++                return;
++            }
+ 
+-        // (5) triggerInterval 가드: 0/음수면 스냅샷 비활성(모듈로 회피).
+-        boolean snapshotEnabled = triggerInterval > 0;
+-
+-        // (6) 이벤트를 순서대로 적용하며 running 카운터로 N배수 도달 시점의 정확한 seq를 수집한다.
+-        //     gap-fill로 다건을 일괄 적용해도 각 N배수 seq마다 스냅샷이 트리거되도록 한다(AC-9).
+-        long running = since0;
+-        List<Long> snapshotSeqs = new ArrayList<>();
+-        for (StoredEvent event : events) {
+-            projectionUpdater.apply(event);
+-            // lag은 live(incoming) 이벤트에 대해서만 기록한다. gap-fill 보강분은 과거 이벤트라
+-            // lag이 크게 잡혀 lastLag/maxLag을 왜곡하므로 제외한다(정상 경로는 events가 incoming
+-            // 1건이라 동일 동작, gap-fill은 마지막 incoming만 기록).
+-            if (event.seq() == incoming.seq()) {
+-                lagMetrics.record(event.occurredAt(), Instant.now());
++            // (3) 적용 전 스냅샷 카운터(마지막 스냅샷 이후 잔여 건수). 항상 [0, triggerInterval) 범위.
++            long since0 = off.eventsSinceSnapshot();
++
++            // (4) 적용 범위 결정.
++            List<StoredEvent> events;
++            if (incoming.seq() == lastApplied + 1) {
++                // 정상 진행: 재조회 없이 incoming 1건만 적용.
++                events = List.of(incoming);
++            } else {
++                // gap(incoming.seq > lastApplied + 1): event store가 순서·완전성 권위(FR-P2-7).
++                // findBySeqRange는 (fromExclusive, toInclusive] 반개구간 + seq 오름차순이므로
++                // (lastApplied, incoming.seq] 범위 전체가 누락분 포함 순서대로 조회된다.
++                events = eventStore.findBySeqRange(sessionId, lastApplied, incoming.seq());
+             }
+-            running++;
+-            if (snapshotEnabled && running % triggerInterval == 0) {
+-                snapshotSeqs.add(event.seq());
++
++            // (5) triggerInterval 가드: 0/음수면 스냅샷 비활성(모듈로 회피).
++            boolean snapshotEnabled = triggerInterval > 0;
++
++            // (6) 이벤트를 순서대로 적용하며 running 카운터로 N배수 도달 시점의 정확한 seq를 수집한다.
++            //     gap-fill로 다건을 일괄 적용해도 각 N배수 seq마다 스냅샷이 트리거되도록 한다(AC-9).
++            long running = since0;
++            List<Long> snapshotSeqs = new ArrayList<>();
++            for (StoredEvent event : events) {
++                projectionUpdater.apply(event);
++                // lag은 live(incoming) 이벤트에 대해서만 기록한다. gap-fill 보강분은 과거 이벤트라
++                // lag이 크게 잡혀 lastLag/maxLag을 왜곡하므로 제외한다(정상 경로는 events가 incoming
++                // 1건이라 동일 동작, gap-fill은 마지막 incoming만 기록).
++                if (event.seq() == incoming.seq()) {
++                    lagMetrics.record(event.occurredAt(), Instant.now());
++                }
++                running++;
++                if (snapshotEnabled && running % triggerInterval == 0) {
++                    snapshotSeqs.add(event.seq());
++                }
+             }
+-        }
+ 
+-        // (7) offset 갱신(절대값): last_applied_seq=incoming.seq, events_since_snapshot=마지막 스냅샷 이후 잔여.
+-        long leftover = snapshotEnabled ? (running % triggerInterval) : 0L;
+-        offsetDao.updateOffset(sessionId, incoming.seq(), leftover);
+-
+-        // (8) 스냅샷 트리거(§11, FR-P2-8, Q3): 수집한 각 N배수 seq에 대해 afterCommit으로 createSnapshot 위임.
+-        //
+-        // Q3 일관성 근거: 카운터는 (7)에서 잔여값으로 절대 갱신되므로 스냅샷이 실패해도 다음 N건이 쌓이면
+-        // 재트리거되며, createSnapshot은 같은 up_to_seq 재생성이 무해하므로(멱등 BR-5) 중복도 안전하다.
+-        // 스냅샷 일시 누락은 복원 비용 상한의 일시 위반일 뿐 정확성에는 무손상(BR-6).
+-        for (long seq : snapshotSeqs) {
+-            final long upToSeq = seq;
+-            triggerSnapshotAfterCommit(sessionId, upToSeq);
++            // (7) offset 갱신(절대값): last_applied_seq=incoming.seq, events_since_snapshot=마지막 스냅샷 이후 잔여.
++            long leftover = snapshotEnabled ? (running % triggerInterval) : 0L;
++            offsetDao.updateOffset(sessionId, incoming.seq(), leftover);
++
++            // (8) 스냅샷 트리거(§11, FR-P2-8, Q3): 수집한 각 N배수 seq에 대해 afterCommit으로 createSnapshot 위임.
++            //
++            // Q3 일관성 근거: 카운터는 (7)에서 잔여값으로 절대 갱신되므로 스냅샷이 실패해도 다음 N건이 쌓이면
++            // 재트리거되며, createSnapshot은 같은 up_to_seq 재생성이 무해하므로(멱등 BR-5) 중복도 안전하다.
++            // 스냅샷 일시 누락은 복원 비용 상한의 일시 위반일 뿐 정확성에는 무손상(BR-6).
++            for (long seq : snapshotSeqs) {
++                final long upToSeq = seq;
++                triggerSnapshotAfterCommit(sessionId, upToSeq);
++            }
++        } finally {
++            MDC.remove(MDC_SESSION_ID);
++            MDC.remove(MDC_SEQ);
++            MDC.remove(MDC_EVENT_TYPE);
+         }
+     }
+ 
+diff --git a/src/main/java/com/realtimechat/projection/async/ProjectionLagMetrics.java b/src/main/java/com/realtimechat/projection/async/ProjectionLagMetrics.java
+index aa184b5..4fc3f20 100644
+--- a/src/main/java/com/realtimechat/projection/async/ProjectionLagMetrics.java
++++ b/src/main/java/com/realtimechat/projection/async/ProjectionLagMetrics.java
+@@ -1,5 +1,8 @@
+ package com.realtimechat.projection.async;
+ 
++import io.micrometer.core.instrument.Counter;
++import io.micrometer.core.instrument.Gauge;
++import io.micrometer.core.instrument.MeterRegistry;
+ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -8,8 +11,15 @@ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+- * Projection lag 메트릭(BR-7). 이벤트 occurred_at과 read model 반영 시각의 차이를 기록한다.
+- * 외부 메트릭 라이브러리(Micrometer) 미도입 환경의 경량 기반 — Phase 3 관측성 고도화 시 교체.
++ * Projection lag 메트릭(BR-7) + 비동기 파이프라인 관측성 메트릭(설계서 §5-D, BR-6).
++ *
++ * <p>이벤트 occurred_at과 read model 반영 시각의 차이(lag)를 기록하고, Micrometer
++ * {@link MeterRegistry}에 Gauge/Counter로 노출한다. lag 값은 기존 {@link AtomicLong}에
++ * 보관하고 그 스냅샷을 Gauge 소스로 등록하므로(값 보관은 AtomicLong 유지) 기존 getter/호출부는
++ * 무변경이다.
++ *
++ * <p>BR-6: 카운터/게이지는 모두 인메모리 기반이라 애플리케이션 재시작 시 0부터 시작한다
++ * (영속화하지 않음). 이벤트 자체의 진실의 원천은 event store다.
+  */
+ @Component
+ public class ProjectionLagMetrics {
+@@ -20,6 +30,24 @@ public class ProjectionLagMetrics {
+     private final AtomicLong maxLagMillis = new AtomicLong(0L);
+     private final AtomicLong dlqWriteFailures = new AtomicLong(0L);
+ 
++    private final Counter dlqFailuresCounter;
++    private final Counter streamProcessedCounter;
++    private final Counter outboxRelayedCounter;
++
++    public ProjectionLagMetrics(MeterRegistry registry) {
++        // lag 게이지: 값은 AtomicLong에 보관하고 스냅샷을 Gauge 소스로 노출한다(state 태그로 구분).
++        Gauge.builder("chat.projection.lag.millis", lastLagMillis, AtomicLong::get)
++                .tag("state", "last")
++                .register(registry);
++        Gauge.builder("chat.projection.lag.millis", maxLagMillis, AtomicLong::get)
++                .tag("state", "max")
++                .register(registry);
++
++        this.dlqFailuresCounter = Counter.builder("chat.projection.dlq.failures").register(registry);
++        this.streamProcessedCounter = Counter.builder("chat.stream.processed").register(registry);
++        this.outboxRelayedCounter = Counter.builder("chat.outbox.relayed").register(registry);
++    }
++
+     /** 이벤트가 read model에 반영된 시점에 호출. lag = now - occurredAt. */
+     public void record(Instant occurredAt, Instant appliedAt) {
+         if (occurredAt == null || appliedAt == null) {
+@@ -37,6 +65,17 @@ public class ProjectionLagMetrics {
+     /** DLQ XADD 실패 시 호출. 운영 알림(Phase 3 관측성)의 기반 카운터. */
+     public void recordDlqWriteFailure() {
+         dlqWriteFailures.incrementAndGet();
++        dlqFailuresCounter.increment();
++    }
++
++    /** 스트림 이벤트 1건 처리 완료 시 호출(처리량 관측). */
++    public void recordStreamProcessed() {
++        streamProcessedCounter.increment();
++    }
++
++    /** Outbox 릴레이로 Redis Stream에 발행된 레코드 수만큼 증가(릴레이 처리량 관측). */
++    public void recordOutboxRelayed(long n) {
++        outboxRelayedCounter.increment(n);
+     }
+ 
+     public long lastLagMillis() { return lastLagMillis.get(); }
+diff --git a/src/main/java/com/realtimechat/projection/async/ProjectionWorker.java b/src/main/java/com/realtimechat/projection/async/ProjectionWorker.java
+index bb8da53..bb6e943 100644
+--- a/src/main/java/com/realtimechat/projection/async/ProjectionWorker.java
++++ b/src/main/java/com/realtimechat/projection/async/ProjectionWorker.java
+@@ -197,6 +197,8 @@ public class ProjectionWorker implements SmartLifecycle {
+ 
+         // apply TX 커밋 성공 후에만 XACK.
+         redisTemplate.opsForStream().acknowledge(props.stream(), props.group(), record.getId());
++        // 스트림에서 소비·ACK한 메시지 1건 처리 완료(처리량 관측, FR-P3-4). DLQ 경로는 별도 카운터.
++        lagMetrics.recordStreamProcessed();
+     }
+ 
+     /**
+diff --git a/src/main/java/com/realtimechat/query/QueryController.java b/src/main/java/com/realtimechat/query/QueryController.java
+index f244158..0411681 100644
+--- a/src/main/java/com/realtimechat/query/QueryController.java
++++ b/src/main/java/com/realtimechat/query/QueryController.java
+@@ -1,6 +1,7 @@
+ package com.realtimechat.query;
+ 
+ import com.realtimechat.common.error.InvalidEventException;
++import com.realtimechat.common.web.LimitSupport;
+ import com.realtimechat.projection.MessageViewDao;
+ import com.realtimechat.restore.RestoreService;
+ import com.realtimechat.restore.SessionState;
+@@ -34,9 +35,6 @@ public class QueryController {
+ 
+     private static final int DEFAULT_LIVE_MESSAGES = 50;
+ 
+-    /** limit 파라미터 상한(RISK 보강). 과도한 N으로 인한 메모리/응답 비대화를 막는다. */
+-    private static final int MAX_LIMIT = 500;
+-
+     private final RestoreService restoreService;
+     private final SnapshotService snapshotService;
+     private final MessageViewDao messageViewDao;
+@@ -72,7 +70,7 @@ public class QueryController {
+             @RequestParam(name = "at", required = false) String at,
+             @RequestParam(name = "limit", required = false) Integer limit) {
+         SessionState state = restore(id, at);
+-        int recent = limit != null ? validateLimit(limit) : timelineRecentMessages;
++        int recent = limit != null ? LimitSupport.validate(limit) : timelineRecentMessages;
+         return TimelineResponse.from(state, recent);
+     }
+ 
+@@ -86,7 +84,7 @@ public class QueryController {
+     public List<MessageDto> messages(
+             @PathVariable UUID id,
+             @RequestParam(name = "limit", required = false, defaultValue = "" + DEFAULT_LIVE_MESSAGES) int limit) {
+-        return messageViewDao.findRecent(id, validateLimit(limit)).stream()
++        return messageViewDao.findRecent(id, LimitSupport.validate(limit)).stream()
+                 .map(MessageDto::from)
+                 .toList();
+     }
+@@ -132,18 +130,6 @@ public class QueryController {
+         }
+     }
+ 
+-    /**
+-     * limit 범위 검증(1~{@value #MAX_LIMIT}). 범위 밖이면 {@link InvalidEventException}(400).
+-     * 미지정 기본값은 호출부에서 결정하므로 여기서는 명시된 값만 검증한다.
+-     */
+-    private static int validateLimit(int limit) {
+-        if (limit < 1 || limit > MAX_LIMIT) {
+-            throw new InvalidEventException(
+-                    "Invalid 'limit': must be between 1 and " + MAX_LIMIT + ", got: " + limit);
+-        }
+-        return limit;
+-    }
+-
+     /** {@code at}이 순수 정수(seq)인지 판별한다. 음수·소수·문자 혼합은 timestamp 경로로 보낸다. */
+     private static boolean isSeq(String value) {
+         if (value.isEmpty()) {
+diff --git a/src/main/java/com/realtimechat/query/ResumeEventController.java b/src/main/java/com/realtimechat/query/ResumeEventController.java
+new file mode 100644
+index 0000000..4b0a645
+--- /dev/null
++++ b/src/main/java/com/realtimechat/query/ResumeEventController.java
+@@ -0,0 +1,83 @@
++package com.realtimechat.query;
++
++import com.realtimechat.common.error.InvalidEventException;
++import com.realtimechat.common.error.SessionNotFoundException;
++import com.realtimechat.common.web.LimitSupport;
++import com.realtimechat.event.EventStore;
++import com.realtimechat.event.StoredEvent;
++import com.realtimechat.query.ResumeResponse.ResumeEvent;
++import com.realtimechat.session.SessionDao;
++import java.util.List;
++import java.util.UUID;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * resume-by-seq 조회 REST 컨트롤러(설계서 §5-C, §11 {@code GET /sessions/{id}/events?afterSeq=}, PRD R6).
++ *
++ * <p>{@code afterSeq} 이후의 raw 이벤트 delta를 반환한다(결정 E). fold된 상태를 주는
++ * {@code GET /sessions/{id}/timeline}({@link QueryController})과 달리, 실제 이벤트 시퀀스를
++ * 그대로 노출하여 재연결 클라이언트가 누락 구간만 따라잡게 한다. 비즈니스 로직은
++ * {@link EventStore}에 있고, 이 컨트롤러는 검증·세션 존재 확인·매핑만 한다.
++ */
++@RestController
++public class ResumeEventController {
++
++    private final EventStore eventStore;
++    private final SessionDao sessionDao;
++
++    public ResumeEventController(EventStore eventStore, SessionDao sessionDao) {
++        this.eventStore = eventStore;
++        this.sessionDao = sessionDao;
++    }
++
++    /**
++     * resume delta 조회(설계서 §5-C, §11 {@code GET /sessions/{id}/events}).
++     *
++     * <p>검증 순서(§5-C):
++     * <ol>
++     *   <li>{@code afterSeq}는 필수 — 누락 시 {@link InvalidEventException}(400, AC-9).
++     *       {@code required=false}로 받아 직접 검증하여 {@code MissingServletRequestParameterException}을 회피한다.</li>
++     *   <li>{@code limit}은 {@link LimitSupport#validate(int)}로 1~{@value LimitSupport#MAX_LIMIT} 검증(400, AC-10).</li>
++     *   <li>세션이 없으면 {@link SessionNotFoundException}(404, AC-11).</li>
++     * </ol>
++     *
++     * <p>조회/hasMore: {@code findBySeqRange}는 반개구간 {@code (from, to]}이므로
++     * {@code findBySeqRange(id, afterSeq, afterSeq + limit + 1)}로 afterSeq 초과 이벤트를 최대
++     * {@code limit+1}건 가져온다. {@code limit+1}건이면 다음 페이지가 있으므로 {@code hasMore=true}로
++     * 두고 앞 {@code limit}개만 반환한다. {@code afterSeq >= maxSeq}면 빈 결과 + {@code hasMore=false}로
++     * 자연 충족된다(AC-6/7/8).
++     *
++     * @param id       대상 세션
++     * @param afterSeq 이 seq를 초과하는 이벤트만 조회(필수)
++     * @param limit    최대 이벤트 수(optional, 기본 100, 1~{@value LimitSupport#MAX_LIMIT})
++     */
++    @GetMapping("/sessions/{id}/events")
++    public ResumeResponse events(
++            @PathVariable UUID id,
++            @RequestParam(name = "afterSeq", required = false) Long afterSeq,
++            @RequestParam(name = "limit", required = false, defaultValue = "100") int limit) {
++        if (afterSeq == null) {
++            throw new InvalidEventException("Missing required parameter 'afterSeq'");
++        }
++        if (afterSeq < 0) {
++            throw new InvalidEventException("afterSeq must be >= 0");
++        }
++        int validated = LimitSupport.validate(limit);
++        if (sessionDao.status(id).isEmpty()) {
++            throw new SessionNotFoundException(id);
++        }
++
++        // 반개구간 (from, to] — afterSeq 초과 이벤트를 hasMore 판정용으로 validated+1건까지 조회
++        List<StoredEvent> rows = eventStore.findBySeqRange(id, afterSeq, afterSeq + validated + 1);
++
++        boolean hasMore = rows.size() > validated;
++        List<StoredEvent> page = hasMore ? rows.subList(0, validated) : rows;
++        List<ResumeEvent> events = page.stream()
++                .map(ResumeEvent::from)
++                .toList();
++        return new ResumeResponse(events, hasMore);
++    }
++}
+diff --git a/src/main/java/com/realtimechat/query/ResumeResponse.java b/src/main/java/com/realtimechat/query/ResumeResponse.java
+new file mode 100644
+index 0000000..a3ccfea
+--- /dev/null
++++ b/src/main/java/com/realtimechat/query/ResumeResponse.java
+@@ -0,0 +1,38 @@
++package com.realtimechat.query;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.realtimechat.event.EventType;
++import com.realtimechat.event.StoredEvent;
++import java.time.Instant;
++import java.util.List;
++
++/**
++ * resume-by-seq 응답(설계서 §5-C / §11 {@code GET /sessions/{id}/events?afterSeq=}, PRD R6, FR-P3-3).
++ *
++ * <p>timeline({@link TimelineResponse})이 snapshot+replay로 <b>fold된 상태</b>를 돌려주는 것과 달리,
++ * resume는 {@code afterSeq} 이후의 <b>raw 이벤트 delta</b>(실제 이벤트 시퀀스, seq 오름차순)를 그대로
++ * 노출한다(결정 E). 클라이언트는 재연결 시 마지막 수신 seq를 {@code afterSeq}로 보내 누락 구간만
++ * delta로 수신한 뒤 STOMP를 재구독한다.
++ *
++ * @param events  afterSeq 이후 이벤트(seq 오름차순, 최대 limit개)
++ * @param hasMore limit을 초과하는 이벤트가 더 있으면 true(다음 페이지 존재)
++ */
++public record ResumeResponse(List<ResumeEvent> events, boolean hasMore) {
++
++    /**
++     * resume delta의 단일 이벤트 표현. payload는 {@link JsonNode}를 그대로 노출하여
++     * 타입별 역직렬화는 클라이언트에 맡긴다({@link StoredEvent}의 payload 매핑과 동일).
++     *
++     * @param seq        세션별 단조증가 seq
++     * @param type       이벤트 유형
++     * @param payload    payload(JSONB → JsonNode 그대로)
++     * @param occurredAt 발생 시각
++     */
++    public record ResumeEvent(long seq, EventType type, JsonNode payload, Instant occurredAt) {
++
++        /** 저장 이벤트를 resume delta 표현으로 매핑한다. */
++        public static ResumeEvent from(StoredEvent e) {
++            return new ResumeEvent(e.seq(), e.type(), e.payload(), e.occurredAt());
++        }
++    }
++}
+diff --git a/src/main/java/com/realtimechat/realtime/FanoutProps.java b/src/main/java/com/realtimechat/realtime/FanoutProps.java
+new file mode 100644
+index 0000000..065f8dc
+--- /dev/null
++++ b/src/main/java/com/realtimechat/realtime/FanoutProps.java
+@@ -0,0 +1,27 @@
++package com.realtimechat.realtime;
++
++import org.springframework.boot.context.properties.ConfigurationProperties;
++
++/**
++ * {@code chat.fanout.*} 설정 바인딩(설계서 §2-A, §5-A).
++ *
++ * <p>Spring Boot 3.x 생성자 바인딩(record)을 사용한다. relaxed binding 으로
++ * {@code channel-prefix} → {@code channelPrefix} 가 자동 매핑된다.
++ *
++ * <p>{@code mode}는 팬아웃 백플레인 스위치다: 기본 {@code local}(직접 STOMP 전달),
++ * 다중 인스턴스 프로파일에서 {@code redis}(Pub/Sub publish)로 명시 오버라이드한다.
++ * 두 모드는 한 시점에 한 구현체만 빈으로 등록되어 이중 전달이 발생하지 않는다.
++ *
++ * <p>{@code @ConfigurationPropertiesScan}이 {@code RealtimeChatApplication}에 활성이므로
++ * {@code StreamProps}와 동일하게 자동 스캔·바인딩된다.
++ */
++@ConfigurationProperties(prefix = "chat.fanout")
++public record FanoutProps(
++        String mode,
++        String channelPrefix) {
++
++    public FanoutProps {
++        if (mode == null || mode.isBlank())                   mode = "local";
++        if (channelPrefix == null || channelPrefix.isBlank()) channelPrefix = "chat.fanout.";
++    }
++}
+diff --git a/src/main/java/com/realtimechat/realtime/RedisPubSubSessionBroadcaster.java b/src/main/java/com/realtimechat/realtime/RedisPubSubSessionBroadcaster.java
+new file mode 100644
+index 0000000..e3c8c09
+--- /dev/null
++++ b/src/main/java/com/realtimechat/realtime/RedisPubSubSessionBroadcaster.java
+@@ -0,0 +1,50 @@
++package com.realtimechat.realtime;
++
++import com.realtimechat.common.json.JsonUtil;
++import com.realtimechat.event.StoredEvent;
++import java.util.UUID;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.stereotype.Component;
++
++/**
++ * {@link SessionBroadcaster}의 Phase 3 Redis Pub/Sub 구현체(설계서 §2-A, §5-A).
++ *
++ * <p>{@code chat.fanout.mode=redis}일 때만 등록되어 {@link SimpSessionBroadcaster}를 대체한다.
++ * 커밋된 이벤트를 {@code chat.fanout.{sessionId}} 채널로 publish만 하고, 로컬 STOMP 전달은
++ * 하지 않는다(<b>이중 전달 금지 불변식</b>). 다중 인스턴스는 각자 {@link SessionFanoutListener}로
++ * 이 채널을 구독하며, publish 노드 자신도 자기 구독 echo 경로로만 로컬 전달하여 노드 대칭·중복 없음을 보장한다.
++ *
++ * <p>채널·페이로드는 {@code "chat.fanout." + sessionId}와 {@link EventBroadcast}(JSON)이며,
++ * 구독측이 동일 {@code EventBroadcast}로 복원해 STOMP {@code /topic/session.{id}}로 전달한다 —
++ * Pub/Sub·STOMP 페이로드 형태가 일치한다.
++ *
++ * <p>publish 실패는 진실의 원천(Event Store)을 오염시키지 않으므로 WARN 로그 후 무시한다(BR-7).
++ */
++@Component
++@ConditionalOnProperty(name = "chat.fanout.mode", havingValue = "redis")
++public class RedisPubSubSessionBroadcaster implements SessionBroadcaster {
++
++    private static final Logger log = LoggerFactory.getLogger(RedisPubSubSessionBroadcaster.class);
++
++    private final StringRedisTemplate stringRedisTemplate;
++    private final FanoutProps fanoutProps;
++
++    public RedisPubSubSessionBroadcaster(StringRedisTemplate stringRedisTemplate, FanoutProps fanoutProps) {
++        this.stringRedisTemplate = stringRedisTemplate;
++        this.fanoutProps = fanoutProps;
++    }
++
++    @Override
++    public void broadcast(UUID sessionId, StoredEvent event) {
++        String channel = fanoutProps.channelPrefix() + sessionId;
++        String json = JsonUtil.toJson(EventBroadcast.from(event));
++        try {
++            stringRedisTemplate.convertAndSend(channel, json);
++        } catch (RuntimeException e) {
++            log.warn("fanout publish 실패(무시): sid={}, seq={}", sessionId, event.seq(), e);
++        }
++    }
++}
+diff --git a/src/main/java/com/realtimechat/realtime/SessionFanoutListener.java b/src/main/java/com/realtimechat/realtime/SessionFanoutListener.java
+new file mode 100644
+index 0000000..25ded35
+--- /dev/null
++++ b/src/main/java/com/realtimechat/realtime/SessionFanoutListener.java
+@@ -0,0 +1,58 @@
++package com.realtimechat.realtime;
++
++import com.realtimechat.common.json.JsonUtil;
++import java.nio.charset.StandardCharsets;
++import java.util.UUID;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.data.redis.connection.Message;
++import org.springframework.data.redis.connection.MessageListener;
++import org.springframework.messaging.simp.SimpMessagingTemplate;
++import org.springframework.stereotype.Component;
++
++/**
++ * Redis Pub/Sub 팬아웃 채널 구독자(설계서 §2-A, §5-A) — {@code chat.fanout.mode=redis}에서만 등록.
++ *
++ * <p>{@code RedisMessageListenerContainer}가 {@code PatternTopic("chat.fanout.*")}로 라우팅한
++ * 메시지를 받아, 채널명에서 sessionId를 파싱하고 본문을 {@link EventBroadcast}로 복원한 뒤
++ * STOMP {@code /topic/session.{id}}로 로컬 구독자에게 전달한다. 이로써 publish 노드와 구독 노드가
++ * 동일 경로로 로컬 전달하여 노드 대칭을 이룬다.
++ *
++ * <p>한 메시지의 역직렬화·전달 실패가 컨테이너를 죽이지 않도록 WARN 로그 후 무시한다.
++ */
++@Component
++@ConditionalOnProperty(name = "chat.fanout.mode", havingValue = "redis")
++public class SessionFanoutListener implements MessageListener {
++
++    private static final Logger log = LoggerFactory.getLogger(SessionFanoutListener.class);
++
++    /** {@link SimpSessionBroadcaster}와 동일한 구독 토픽 prefix(설계서 §6). */
++    private static final String TOPIC_PREFIX = "/topic/session.";
++
++    private final SimpMessagingTemplate messagingTemplate;
++    private final FanoutProps fanoutProps;
++
++    public SessionFanoutListener(SimpMessagingTemplate messagingTemplate, FanoutProps fanoutProps) {
++        this.messagingTemplate = messagingTemplate;
++        this.fanoutProps = fanoutProps;
++    }
++
++    @Override
++    public void onMessage(Message message, byte[] pattern) {
++        String channel = new String(message.getChannel(), StandardCharsets.UTF_8);
++        try {
++            String sessionId = channel.substring(fanoutProps.channelPrefix().length());
++            // chat.fanout.* 임의 채널 publish 시 비-UUID sessionId가 /topic/session.{임의}로
++            // 전달되는 것을 방어한다. 정상 경로는 chat.fanout.{UUID}이므로 항상 통과한다.
++            UUID.fromString(sessionId);
++            String body = new String(message.getBody(), StandardCharsets.UTF_8);
++            EventBroadcast broadcast = JsonUtil.mapper().readValue(body, EventBroadcast.class);
++            messagingTemplate.convertAndSend(TOPIC_PREFIX + sessionId, broadcast);
++        } catch (IllegalArgumentException e) {
++            log.warn("fanout 수신 처리 실패(비-UUID sessionId 무시): channel={}", channel);
++        } catch (Exception e) {
++            log.warn("fanout 수신 처리 실패(무시): channel={}", channel, e);
++        }
++    }
++}
+diff --git a/src/main/java/com/realtimechat/realtime/SimpSessionBroadcaster.java b/src/main/java/com/realtimechat/realtime/SimpSessionBroadcaster.java
+index f1d44ed..3889a5b 100644
+--- a/src/main/java/com/realtimechat/realtime/SimpSessionBroadcaster.java
++++ b/src/main/java/com/realtimechat/realtime/SimpSessionBroadcaster.java
+@@ -2,6 +2,7 @@ package com.realtimechat.realtime;
+ 
+ import com.realtimechat.event.StoredEvent;
+ import java.util.UUID;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.messaging.simp.SimpMessagingTemplate;
+ import org.springframework.stereotype.Component;
+ 
+@@ -17,8 +18,14 @@ import org.springframework.stereotype.Component;
+  * 이 경로 하나로만 일어나 중복 전달을 방지한다(설계서 §6).
+  *
+  * <p>다중 인스턴스 팬아웃(Redis Pub/Sub backplane)은 Phase 3 확장 항목이다(설계서 §7).
++ *
++ * <p>Phase 3 모드 스위치(설계서 §2-A, §5-A): {@code chat.fanout.mode=local}(기본,
++ * {@code matchIfMissing})일 때만 이 빈이 등록되어 직접 STOMP 전달을 수행한다.
++ * {@code redis} 모드에서는 {@link RedisPubSubSessionBroadcaster}가 대신 등록되어
++ * publish만 수행한다(이중 전달 금지 불변식). 한 시점에 한 구현체만 등록되어 주입 모호성이 없다.
+  */
+ @Component
++@ConditionalOnProperty(name = "chat.fanout.mode", havingValue = "local", matchIfMissing = true)
+ public class SimpSessionBroadcaster implements SessionBroadcaster {
+ 
+     /** 구독 토픽 prefix. {@code WebSocketConfig}의 SimpleBroker prefix(/topic)와 일관(설계서 §6). */
+diff --git a/src/main/resources/application.yml b/src/main/resources/application.yml
+index 94415f5..3632893 100644
+--- a/src/main/resources/application.yml
++++ b/src/main/resources/application.yml
+@@ -24,8 +24,19 @@ logging:
+   level:
+     root: INFO
+     com.realtimechat: DEBUG
++  # 구조화 로그(FR-P3-6, [Could]): Spring Boot 기본 콘솔 패턴에 MDC 필드만 덧붙임.
++  # MDC 없는 로그(예: 부팅·스케줄러)에서는 default(:-)로 빈 값 표시되어 가독성 유지.
++  pattern:
++    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} [sid=%X{sessionId:-} seq=%X{seq:-} type=%X{eventType:-}] %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n${LOG_EXCEPTION_CONVERSION_WORD:-%wEx}"
+ 
+ chat:
++  fanout:
++    mode: local                 # local | redis. 기본 local(단일 인스턴스).
++    channel-prefix: "chat.fanout."
++  presence:
++    ttl-seconds: 90
++    heartbeat-interval-seconds: 30
++    expiry-poll-ms: 5000
+   outbox:
+     relay:
+       poll-interval-ms: 500
+@@ -44,3 +55,12 @@ chat:
+     read-block-ms: 2000
+     read-count: 50
+     stream-maxlen: 100000
++
++management:
++  endpoints:
++    web:
++      exposure:
++        include: health,info,prometheus
++  endpoint:
++    health:
++      show-details: always
+diff --git a/src/test/java/com/realtimechat/integration/ActuatorEndpointIntegrationTest.java b/src/test/java/com/realtimechat/integration/ActuatorEndpointIntegrationTest.java
+new file mode 100644
+index 0000000..e4e3592
+--- /dev/null
++++ b/src/test/java/com/realtimechat/integration/ActuatorEndpointIntegrationTest.java
+@@ -0,0 +1,73 @@
++package com.realtimechat.integration;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.realtimechat.support.AbstractIntegrationTest;
++import java.util.Map;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.web.client.TestRestTemplate;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
++
++/**
++ * Actuator 엔드포인트 통합 테스트(설계서 §5-D 관측성, PRD R7, AC-12/AC-13).
++ *
++ * <p>{@code management.endpoints.web.exposure.include=health,info,prometheus}와
++ * {@code endpoint.health.show-details=always} 설정이 실 환경에서 노출되는지 검증한다.
++ *
++ * <p>메트릭 이름은 Micrometer→Prometheus 명명 규칙으로 변환됨에 유의한다(점→밑줄, Counter는
++ * {@code _total} 접미사). 소스({@code ProjectionLagMetrics})의 등록명 기준:
++ * <ul>
++ *   <li>{@code chat.projection.lag.millis}(Gauge) → {@code chat_projection_lag_millis}</li>
++ *   <li>{@code chat.projection.dlq.failures}(Counter) → {@code chat_projection_dlq_failures_total}</li>
++ *   <li>{@code chat.stream.processed}(Counter) → {@code chat_stream_processed_total}</li>
++ *   <li>{@code chat.outbox.relayed}(Counter) → {@code chat_outbox_relayed_total}</li>
++ * </ul>
++ * 카운터/게이지는 {@code ProjectionLagMetrics} 생성자에서 등록되므로 값이 0이어도 노출된다.
++ */
++class ActuatorEndpointIntegrationTest extends AbstractIntegrationTest {
++
++    @Autowired private TestRestTemplate rest;
++
++    @Test
++    @DisplayName("AC-12: GET /actuator/prometheus → 200, chat 메트릭 이름 노출")
++    void prometheusExposesChatMetrics() {
++        ResponseEntity<String> resp = rest.getForEntity("/actuator/prometheus", String.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++        String body = resp.getBody();
++        assertThat(body).isNotNull();
++
++        // gauge: 점→밑줄 변환. 라벨 형식은 환경차가 있을 수 있어 메트릭명 substring으로 단언.
++        assertThat(body).contains("chat_projection_lag_millis");
++        // counter: _total 접미사. 생성자 등록이라 값 0이어도 HELP/TYPE 라인으로 노출.
++        assertThat(body).contains("chat_projection_dlq_failures_total");
++        assertThat(body).contains("chat_stream_processed_total");
++        assertThat(body).contains("chat_outbox_relayed_total");
++    }
++
++    @SuppressWarnings("unchecked")
++    @Test
++    @DisplayName("AC-13: GET /actuator/health → 200, status=UP, components(db/redis) UP")
++    void healthShowsDetailsWithComponents() {
++        ResponseEntity<Map> resp = rest.getForEntity("/actuator/health", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++        Map<String, Object> body = resp.getBody();
++        assertThat(body).isNotNull();
++        assertThat(body.get("status")).isEqualTo("UP");
++
++        // show-details: always → components 노출
++        Map<String, Object> components = (Map<String, Object>) body.get("components");
++        assertThat(components).isNotNull();
++        assertThat(components).containsKeys("db", "redis");
++
++        Map<String, Object> db = (Map<String, Object>) components.get("db");
++        assertThat(db.get("status")).isEqualTo("UP");
++
++        Map<String, Object> redis = (Map<String, Object>) components.get("redis");
++        assertThat(redis.get("status")).isEqualTo("UP");
++    }
++}
+diff --git a/src/test/java/com/realtimechat/integration/FanoutRedisIntegrationTest.java b/src/test/java/com/realtimechat/integration/FanoutRedisIntegrationTest.java
+new file mode 100644
+index 0000000..e1f879d
+--- /dev/null
++++ b/src/test/java/com/realtimechat/integration/FanoutRedisIntegrationTest.java
+@@ -0,0 +1,169 @@
++package com.realtimechat.integration;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.realtimechat.command.CommandHandler;
++import com.realtimechat.common.json.JsonUtil;
++import com.realtimechat.event.EventType;
++import com.realtimechat.event.payload.MessageSentPayload;
++import com.realtimechat.realtime.EventBroadcast;
++import com.realtimechat.session.SessionService;
++import com.realtimechat.support.AbstractIntegrationTest;
++import java.lang.reflect.Type;
++import java.time.Instant;
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.messaging.converter.MappingJackson2MessageConverter;
++import org.springframework.messaging.simp.stomp.StompFrameHandler;
++import org.springframework.messaging.simp.stomp.StompHeaders;
++import org.springframework.messaging.simp.stomp.StompSession;
++import org.springframework.messaging.simp.stomp.StompSessionHandlerAdapter;
++import org.springframework.test.context.TestPropertySource;
++import org.springframework.web.socket.client.standard.StandardWebSocketClient;
++import org.springframework.web.socket.messaging.WebSocketStompClient;
++
++/**
++ * Redis Pub/Sub 팬아웃 백플레인 통합 테스트(설계서 §2-A, §5-A, FR-P3-1, BR-7, AC-1/2).
++ *
++ * <p>클래스 단위로 {@code chat.fanout.mode=redis}를 오버라이드하여 {@code RedisPubSubSessionBroadcaster}
++ * + {@code SessionFanoutListener} + {@code RedisMessageListenerContainer}(fanout 구독)이 활성인
++ * 별도 컨텍스트로 부팅한다. 이벤트 커밋 후 broadcast가 {@code chat.fanout.{sid}} 채널로 publish →
++ * listener가 수신 → 로컬 STOMP {@code /topic/session.{id}}로 전달하는 redis 백플레인 경로를 검증한다.
++ *
++ * <p><b>AC-1 한계</b>: 단일 JVM 테스트이므로 진짜 2-인스턴스 팬아웃이 아니라 redis 백플레인 동작
++ * (publish→listener 수신→로컬 STOMP 전달, 즉 publish 노드의 자기 echo)과 채널 격리만 검증한다.
++ * 진짜 다중 노드(노드 A publish → 노드 B 로컬 구독자 수신) 검증은 수동 데모로 남긴다.
++ */
++@TestPropertySource(properties = "chat.fanout.mode=redis")
++class FanoutRedisIntegrationTest extends AbstractIntegrationTest {
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired private SessionService sessionService;
++    @Autowired private CommandHandler commandHandler;
++    @Autowired private StringRedisTemplate redisTemplate;
++
++    private WebSocketStompClient newStompClient() {
++        WebSocketStompClient client = new WebSocketStompClient(new StandardWebSocketClient());
++        client.setMessageConverter(new MappingJackson2MessageConverter());
++        return client;
++    }
++
++    // =====================================================================
++    // AC-1: redis 모드에서 broadcast publish → listener 수신 → 로컬 STOMP 전달 → 구독자 1회 수신
++    // =====================================================================
++    @Test
++    @DisplayName("AC-1: redis 팬아웃 — 이벤트 발생 시 publish→listener→로컬 STOMP로 구독자가 MESSAGE_SENT 수신")
++    void ac1_redisBackplaneDeliversToSubscriber() throws Exception {
++        UUID sessionId = sessionService.createSession();
++
++        WebSocketStompClient client = newStompClient();
++        String url = "ws://localhost:" + port + "/ws";
++
++        StompSession session = client
++                .connectAsync(url, new StompSessionHandlerAdapter() { })
++                .get(5, TimeUnit.SECONDS);
++
++        try {
++            CountDownLatch latch = new CountDownLatch(1);
++            AtomicReference<Map<String, Object>> received = new AtomicReference<>();
++
++            session.subscribe("/topic/session." + sessionId, new StompFrameHandler() {
++                @Override
++                public Type getPayloadType(StompHeaders headers) {
++                    return Map.class;
++                }
++
++                @Override
++                @SuppressWarnings("unchecked")
++                public void handleFrame(StompHeaders headers, Object payload) {
++                    received.set((Map<String, Object>) payload);
++                    latch.countDown();
++                }
++            });
++
++            // 구독 등록 + redis 채널 구독이 반영될 시간을 잠시 준다.
++            Thread.sleep(500);
++
++            // 같은 세션에 이벤트 발생 → CommandHandler afterCommit broadcast가 redis로 publish된다.
++            UUID sender = UUID.randomUUID();
++            commandHandler.handle(sessionId, EventType.MESSAGE_SENT,
++                    JsonUtil.toJsonNode(new MessageSentPayload(UUID.randomUUID(), sender, "hello-redis-fanout")),
++                    "fanout-ac1-key", sender);
++
++            boolean got = latch.await(10, TimeUnit.SECONDS);
++            assertThat(got)
++                    .as("redis 백플레인 경유로 구독자가 10초 내 broadcast를 수신해야 한다")
++                    .isTrue();
++            assertThat(received.get()).isNotNull();
++            assertThat(received.get().get("type")).isEqualTo(EventType.MESSAGE_SENT.name());
++        } finally {
++            session.disconnect();
++            client.stop();
++        }
++    }
++
++    // =====================================================================
++    // AC-2: 채널 격리 — 세션 A 구독자는 세션 B 채널에 직접 publish된 메시지를 수신하지 않는다
++    // =====================================================================
++    @Test
++    @DisplayName("AC-2: 채널 격리 — 세션 B 채널에 직접 publish해도 세션 A 구독자는 수신하지 않음")
++    void ac2_channelIsolation() throws Exception {
++        UUID sessionA = sessionService.createSession();
++        UUID sessionB = sessionService.createSession();
++
++        WebSocketStompClient client = newStompClient();
++        String url = "ws://localhost:" + port + "/ws";
++
++        StompSession session = client
++                .connectAsync(url, new StompSessionHandlerAdapter() { })
++                .get(5, TimeUnit.SECONDS);
++
++        try {
++            CountDownLatch latch = new CountDownLatch(1);
++
++            // 세션 A만 구독한다.
++            session.subscribe("/topic/session." + sessionA, new StompFrameHandler() {
++                @Override
++                public Type getPayloadType(StompHeaders headers) {
++                    return Map.class;
++                }
++
++                @Override
++                public void handleFrame(StompHeaders headers, Object payload) {
++                    latch.countDown();
++                }
++            });
++
++            // 구독 + redis 채널 구독 반영 대기.
++            Thread.sleep(500);
++
++            // 세션 B 채널(chat.fanout.{B})에 유효한 EventBroadcast JSON을 직접 publish한다.
++            // EventBroadcast는 RedisPubSubSessionBroadcaster가 publish하는 실제 페이로드 구조다.
++            JsonNode payload = JsonUtil.toJsonNode(
++                    new MessageSentPayload(UUID.randomUUID(), UUID.randomUUID(), "for-session-b"));
++            EventBroadcast broadcastB = new EventBroadcast(
++                    UUID.randomUUID(), sessionB, 1L, EventType.MESSAGE_SENT, payload, Instant.now());
++            redisTemplate.convertAndSend("chat.fanout." + sessionB, JsonUtil.toJson(broadcastB));
++
++            // 세션 A 구독자는 세션 B 채널 메시지를 수신하지 않아야 한다(짧은 타임아웃 내 count down 안 됨).
++            boolean got = latch.await(2, TimeUnit.SECONDS);
++            assertThat(got)
++                    .as("세션 A 구독자는 세션 B 채널 메시지를 수신하면 안 된다(채널 격리)")
++                    .isFalse();
++        } finally {
++            session.disconnect();
++            client.stop();
++        }
++    }
++}
+diff --git a/src/test/java/com/realtimechat/integration/PresenceTtlIntegrationTest.java b/src/test/java/com/realtimechat/integration/PresenceTtlIntegrationTest.java
+new file mode 100644
+index 0000000..d74ce63
+--- /dev/null
++++ b/src/test/java/com/realtimechat/integration/PresenceTtlIntegrationTest.java
+@@ -0,0 +1,187 @@
++package com.realtimechat.integration;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.awaitility.Awaitility.await;
++
++import com.realtimechat.command.CommandHandler;
++import com.realtimechat.common.json.JsonUtil;
++import com.realtimechat.event.EventStore;
++import com.realtimechat.event.EventType;
++import com.realtimechat.event.payload.ParticipantJoinedPayload;
++import com.realtimechat.presence.PresenceTracker;
++import com.realtimechat.session.SessionService;
++import com.realtimechat.support.AbstractIntegrationTest;
++import java.time.Duration;
++import java.util.Map;
++import java.util.UUID;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.web.client.TestRestTemplate;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.http.HttpEntity;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.http.ResponseEntity;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++/**
++ * presence TTL 만료·OFFLINE 자동 수집 통합 테스트(설계서 §5-B, FR-P3-2, BR-2, BR-3, AC-3/4/5).
++ *
++ * <p>실제 PostgreSQL + Redis Testcontainer 위에서 {@code PresenceTracker}(SETEX/SADD liveness),
++ * {@code PresenceSweeper}(@Scheduled 폴링), {@code CommandHandler} OFFLINE 발행, 비동기
++ * projection이 동작하는 {@code @SpringBootTest} 컨텍스트로 heartbeat→TTL 만료→OFFLINE 경로를
++ * 검증한다. test 프로파일은 {@code chat.presence.ttl-seconds=3}, {@code expiry-poll-ms=500}이므로
++ * 키 만료/sweep 감지를 테스트 시간 내(Awaitility 최대 10s)에 관찰할 수 있다.
++ *
++ * <p>각 테스트는 randomUUID 세션/참여자로 데이터를 격리한다(공유 컨테이너). OFFLINE 자동 전환을
++ * 관찰하려면 join으로 read model presence=ONLINE 행을 먼저 만들고, heartbeat로 liveness 키를
++ * 생성해야 한다(OFFLINE 적용은 기존 participant_view 행의 presence 컬럼을 갱신하기 때문).
++ */
++class PresenceTtlIntegrationTest extends AbstractIntegrationTest {
++
++    @Autowired private SessionService sessionService;
++    @Autowired private CommandHandler commandHandler;
++    @Autowired private StringRedisTemplate redisTemplate;
++    @Autowired private EventStore eventStore;
++    @Autowired private JdbcTemplate jdbcTemplate;
++    @Autowired private PresenceTracker presenceTracker;
++    @Autowired private TestRestTemplate rest;
++
++    /** liveness 키({@code presence:{sid}:{pid}}). PresenceTracker와 동일한 스키마. */
++    private static String presenceKey(UUID sessionId, UUID participantId) {
++        return "presence:" + sessionId + ":" + participantId;
++    }
++
++    /** sweep 대상 Set 멤버({@code {sid}:{pid}}). */
++    private static String member(UUID sessionId, UUID participantId) {
++        return sessionId + ":" + participantId;
++    }
++
++    /** heartbeat REST 호출({@code POST /sessions/{id}/heartbeat}, body{participantId}). 204를 단언. */
++    private void heartbeat(UUID sessionId, UUID participantId) {
++        HttpHeaders headers = new HttpHeaders();
++        headers.setContentType(MediaType.APPLICATION_JSON);
++        HttpEntity<Map<String, Object>> req =
++                new HttpEntity<>(Map.of("participantId", participantId.toString()), headers);
++        ResponseEntity<Void> resp =
++                rest.postForEntity("/sessions/" + sessionId + "/heartbeat", req, Void.class);
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
++    }
++
++    /**
++     * join으로 read model에 presence=ONLINE 참여자 행을 만든다(비동기 projection 반영 대기).
++     * OFFLINE 자동 전환은 이 행의 presence 컬럼을 갱신하므로 사전에 행이 존재해야 한다.
++     */
++    private void joinAndAwaitOnline(UUID sessionId, UUID participantId) {
++        commandHandler.handle(sessionId, EventType.PARTICIPANT_JOINED,
++                JsonUtil.toJsonNode(new ParticipantJoinedPayload(participantId)),
++                "join-" + sessionId + "-" + participantId, participantId);
++        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
++                assertThat(presenceOf(sessionId, participantId)).isEqualTo("ONLINE"));
++    }
++
++    /** participant_view.presence 직접 조회. 행이 없으면 null. */
++    private String presenceOf(UUID sessionId, UUID participantId) {
++        return jdbcTemplate.query(
++                "SELECT presence FROM participant_view WHERE session_id = ? AND participant_id = ?",
++                rs -> rs.next() ? rs.getString("presence") : null,
++                sessionId, participantId);
++    }
++
++    /** 이 세션의 PRESENCE_CHANGED(OFFLINE) 이벤트 건수(event 테이블 직접 조회). */
++    private int offlineEventCount(UUID sessionId) {
++        Integer count = jdbcTemplate.queryForObject(
++                "SELECT count(*) FROM event WHERE session_id = ? AND event_type = 'PRESENCE_CHANGED' "
++                        + "AND payload->>'presence' = 'OFFLINE'",
++                Integer.class, sessionId);
++        return count == null ? 0 : count;
++    }
++
++    // =====================================================================
++    // AC-3: heartbeat ping → liveness 키 생성(TTL>0) → ttl(3s) 경과 후 자동 소멸
++    // =====================================================================
++    @Test
++    @DisplayName("AC-3: heartbeat ping → liveness 키 TTL 생성, 갱신 중단 시 ttl 경과 후 키 소멸")
++    void ac3_heartbeatCreatesKeyAndExpires() {
++        UUID sessionId = sessionService.createSession();
++        UUID participantId = UUID.randomUUID();
++
++        heartbeat(sessionId, participantId);
++
++        // heartbeat 직후 liveness 키가 살아있고 TTL(>0)이 설정됨.
++        assertThat(presenceTracker.isAlive(sessionId, participantId)).isTrue();
++        Long ttl = redisTemplate.getExpire(presenceKey(sessionId, participantId));
++        assertThat(ttl).isGreaterThan(0L);
++
++        // 갱신을 중단하면 ttl(3s) 경과 후 키가 사라진다(EXISTS false).
++        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
++                assertThat(presenceTracker.isAlive(sessionId, participantId)).isFalse());
++    }
++
++    // =====================================================================
++    // AC-4: 키 만료 → PresenceSweeper가 OFFLINE 1건 발행 + read model presence=OFFLINE 반영
++    // =====================================================================
++    @Test
++    @DisplayName("AC-4: liveness 키 만료 → sweeper가 PRESENCE_CHANGED(OFFLINE) 발행 + participant_view OFFLINE")
++    void ac4_expiryTriggersOfflineEventAndProjection() {
++        UUID sessionId = sessionService.createSession();
++        UUID participantId = UUID.randomUUID();
++
++        // 참여자를 join시켜 presence=ONLINE 행을 만든다.
++        joinAndAwaitOnline(sessionId, participantId);
++
++        // heartbeat로 liveness 키 생성 → 이후 갱신 중단 → ttl(3s) 만료 → sweeper(poll 500ms)가 OFFLINE 발행.
++        heartbeat(sessionId, participantId);
++        assertThat(presenceTracker.isAlive(sessionId, participantId)).isTrue();
++
++        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
++            // (a) event 테이블에 PRESENCE_CHANGED(OFFLINE) 1건 적재.
++            assertThat(offlineEventCount(sessionId)).isEqualTo(1);
++            // (b) 비동기 projection으로 participant_view.presence='OFFLINE' 반영.
++            assertThat(presenceOf(sessionId, participantId)).isEqualTo("OFFLINE");
++        });
++    }
++
++    // =====================================================================
++    // AC-5(중복 미수집): OFFLINE 1회 발행 후 추가 sweep 주기가 지나도 정확히 1건 유지(SREM 원자 보장)
++    // =====================================================================
++    @Test
++    @DisplayName("AC-5: 만료 OFFLINE 1회 발행 후 추가 sweep에도 PRESENCE_CHANGED(OFFLINE) 정확히 1건 유지")
++    void ac5_offlineEmittedExactlyOnce() {
++        UUID sessionId = sessionService.createSession();
++        UUID participantId = UUID.randomUUID();
++
++        joinAndAwaitOnline(sessionId, participantId);
++
++        heartbeat(sessionId, participantId);
++
++        // 먼저 OFFLINE 1건이 적재될 때까지 대기.
++        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
++                assertThat(offlineEventCount(sessionId)).isEqualTo(1));
++
++        // 이후 추가로 충분히 기다려도(sweep poll 500ms가 여러 번 돌아도) OFFLINE 이벤트는 정확히 1건.
++        // claimExpired의 SREM 원자 제거로 만료 멤버는 1회만 선점되어 중복 발행되지 않는다(BR-3).
++        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(4)).untilAsserted(() ->
++                assertThat(offlineEventCount(sessionId)).isEqualTo(1));
++    }
++
++    // =====================================================================
++    // AC-5(동시성, claimExpired): SADD한 멤버를 claimExpired 2회 호출 시 첫 true / 둘째 false
++    // =====================================================================
++    @Test
++    @DisplayName("AC-5: claimExpired는 SREM 원자성으로 같은 멤버를 1회만 선점(첫 true, 둘째 false)")
++    void ac5_claimExpiredAtomicSingleWinner() {
++        UUID sessionId = UUID.randomUUID();
++        UUID participantId = UUID.randomUUID();
++        String member = member(sessionId, participantId);
++
++        // 사전에 sweep 대상 Set에 멤버를 직접 등록(SADD).
++        redisTemplate.opsForSet().add(PresenceTracker.TRACKED_SET, member);
++
++        // 첫 claim은 제거에 성공(반환 true), 둘째 claim은 이미 제거됐으므로 실패(false).
++        assertThat(presenceTracker.claimExpired(member)).isTrue();
++        assertThat(presenceTracker.claimExpired(member)).isFalse();
++    }
++}
+diff --git a/src/test/java/com/realtimechat/integration/ResumeApiIntegrationTest.java b/src/test/java/com/realtimechat/integration/ResumeApiIntegrationTest.java
+new file mode 100644
+index 0000000..b054fe0
+--- /dev/null
++++ b/src/test/java/com/realtimechat/integration/ResumeApiIntegrationTest.java
+@@ -0,0 +1,201 @@
++package com.realtimechat.integration;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.realtimechat.event.EventType;
++import com.realtimechat.support.AbstractIntegrationTest;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.web.client.TestRestTemplate;
++import org.springframework.http.HttpEntity;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.http.ResponseEntity;
++
++/**
++ * resume-by-seq 조회 REST 통합 테스트(설계서 §5-C / §11 {@code GET /sessions/{id}/events?afterSeq=},
++ * PRD R6, AC-6~AC-11).
++ *
++ * <p>{@link TestRestTemplate}로 실제 HTTP 경유 resume delta 조회의 상태코드·본문(events/hasMore)과
++ * 파라미터 검증(400/404)을 검증한다. 세션마다 새 sessionId로 격리하고, REST로 알려진 seq를 직접
++ * 만들어(join=seq1, 이후 MESSAGE_SENT=seq2,3,...) 전역 카운트에 의존하지 않는다.
++ */
++class ResumeApiIntegrationTest extends AbstractIntegrationTest {
++
++    @Autowired private TestRestTemplate rest;
++
++    private static HttpHeaders json() {
++        HttpHeaders h = new HttpHeaders();
++        h.setContentType(MediaType.APPLICATION_JSON);
++        return h;
++    }
++
++    private static HttpHeaders jsonWithKey(String key) {
++        HttpHeaders h = json();
++        h.set("Idempotency-Key", key);
++        return h;
++    }
++
++    @SuppressWarnings("unchecked")
++    private UUID createSession() {
++        ResponseEntity<Map> resp = rest.postForEntity("/sessions", null, Map.class);
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.CREATED);
++        return UUID.fromString((String) resp.getBody().get("sessionId"));
++    }
++
++    /** join → PARTICIPANT_JOINED, seq=1을 만든다. */
++    private void join(UUID sessionId, UUID participant) {
++        HttpEntity<Map<String, Object>> req = new HttpEntity<>(
++                Map.of("participantId", participant.toString()),
++                jsonWithKey("join-" + participant));
++        ResponseEntity<Map> resp = rest.postForEntity(
++                "/sessions/" + sessionId + "/join", req, Map.class);
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++    }
++
++    /** MESSAGE_SENT 1건 수집(seq는 채번 순서대로 증가). 멱등 키는 호출마다 고유해야 한다. */
++    private void sendMessage(UUID sessionId, UUID sender, String content, String idempotencyKey) {
++        Map<String, Object> body = Map.of(
++                "type", EventType.MESSAGE_SENT.name(),
++                "actorId", sender.toString(),
++                "payload", Map.of("senderId", sender.toString(), "content", content));
++        HttpEntity<Map<String, Object>> req = new HttpEntity<>(body, jsonWithKey(idempotencyKey));
++        ResponseEntity<Map> resp = rest.postForEntity(
++                "/sessions/" + sessionId + "/events", req, Map.class);
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++    }
++
++    /** join(seq1) + count건의 MESSAGE_SENT(seq2..)를 수집한 세션을 만든다. maxSeq = 1 + count. */
++    private UUID seededSession(int messageCount) {
++        UUID sessionId = createSession();
++        UUID sender = UUID.randomUUID();
++        join(sessionId, sender);
++        for (int i = 0; i < messageCount; i++) {
++            sendMessage(sessionId, sender, "msg-" + i, "rk-" + sessionId + "-" + i);
++        }
++        return sessionId;
++    }
++
++    @SuppressWarnings("unchecked")
++    private List<Map<String, Object>> events(Map body) {
++        return (List<Map<String, Object>>) body.get("events");
++    }
++
++    @Test
++    @DisplayName("AC-6: afterSeq=2 조회 → 반환 events의 seq가 모두 >2이고 오름차순")
++    void afterSeqReturnsOnlyGreaterSeqAscending() {
++        // join(seq1) + 5건(seq2..6) → maxSeq=6
++        UUID sessionId = seededSession(5);
++
++        ResponseEntity<Map> resp = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?afterSeq=2&limit=100", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++        List<Map<String, Object>> evs = events(resp.getBody());
++        assertThat(evs).isNotEmpty();
++        List<Long> seqs = evs.stream().map(ev -> ((Number) ev.get("seq")).longValue()).toList();
++        // 반환 seq는 모두 afterSeq(=2) 초과 + 오름차순.
++        assertThat(seqs).allMatch(s -> s > 2L);
++        assertThat(seqs).isSorted();
++    }
++
++    @Test
++    @DisplayName("AC-7: afterSeq>=maxSeq 조회 → events 빈 배열 + hasMore=false")
++    void afterSeqBeyondMaxReturnsEmpty() {
++        UUID sessionId = seededSession(3); // maxSeq=4
++
++        // 매우 큰 값으로 maxSeq 이상 보장
++        ResponseEntity<Map> resp = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?afterSeq=1000000&limit=100", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++        assertThat(events(resp.getBody())).isEmpty();
++        assertThat((Boolean) resp.getBody().get("hasMore")).isFalse();
++    }
++
++    @Test
++    @DisplayName("AC-8: afterSeq 이후 이벤트가 limit보다 많을 때 limit=2 조회 → events.size==2 + hasMore=true")
++    void smallLimitReturnsPageWithHasMore() {
++        // join(seq1) + 5건(seq2..6) → afterSeq=1 이후 5건 존재, limit=2
++        UUID sessionId = seededSession(5);
++
++        ResponseEntity<Map> resp = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?afterSeq=1&limit=2", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++        assertThat(events(resp.getBody())).hasSize(2);
++        assertThat((Boolean) resp.getBody().get("hasMore")).isTrue();
++    }
++
++    @Test
++    @DisplayName("AC-9: afterSeq 파라미터 없이 조회 → 400")
++    void missingAfterSeqReturns400() {
++        UUID sessionId = seededSession(2);
++
++        ResponseEntity<Map> resp = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?limit=10", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
++    }
++
++    @Test
++    @DisplayName("AC-10: limit=0 / limit=501 → 400 (limit 범위 밖)")
++    void limitOutOfRangeReturns400() {
++        UUID sessionId = seededSession(2);
++
++        ResponseEntity<Map> tooLow = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?afterSeq=0&limit=0", Map.class);
++        assertThat(tooLow.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
++
++        ResponseEntity<Map> tooHigh = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?afterSeq=0&limit=501", Map.class);
++        assertThat(tooHigh.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
++    }
++
++    @Test
++    @DisplayName("AC-11: 존재하지 않는 세션으로 조회 → 404")
++    void unknownSessionReturns404() {
++        UUID unknown = UUID.randomUUID();
++
++        ResponseEntity<Map> resp = rest.getForEntity(
++                "/sessions/" + unknown + "/events?afterSeq=0", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
++    }
++
++    @Test
++    @DisplayName("limit 비정수(abc) → 400 (MethodArgumentTypeMismatch 핸들러)")
++    void nonIntegerLimitReturns400() {
++        UUID sessionId = seededSession(2);
++
++        ResponseEntity<Map> resp = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?afterSeq=0&limit=abc", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
++    }
++
++    @Test
++    @DisplayName("afterSeq=0 조회 → seq 1부터 오름차순으로 반환")
++    void afterSeqZeroReturnsFromSeqOne() {
++        UUID sessionId = seededSession(3); // seq1..4
++
++        ResponseEntity<Map> resp = rest.getForEntity(
++                "/sessions/" + sessionId + "/events?afterSeq=0&limit=100", Map.class);
++
++        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
++        List<Map<String, Object>> evs = events(resp.getBody());
++        assertThat(evs).isNotEmpty();
++        List<Long> seqs = evs.stream().map(ev -> ((Number) ev.get("seq")).longValue()).toList();
++        assertThat(seqs).isSorted();
++        assertThat(seqs.get(0)).isEqualTo(1L);
++        // 첫 이벤트는 join → PARTICIPANT_JOINED
++        assertThat(evs.get(0).get("type")).isEqualTo(EventType.PARTICIPANT_JOINED.name());
++        // payload/occurredAt 필드 노출 확인(ResumeEvent.from 매핑)
++        assertThat(evs.get(0)).containsKeys("seq", "type", "payload", "occurredAt");
++    }
++}
+diff --git a/src/test/java/com/realtimechat/realtime/RedisPubSubSessionBroadcasterTest.java b/src/test/java/com/realtimechat/realtime/RedisPubSubSessionBroadcasterTest.java
+new file mode 100644
+index 0000000..ec8030d
+--- /dev/null
++++ b/src/test/java/com/realtimechat/realtime/RedisPubSubSessionBroadcasterTest.java
+@@ -0,0 +1,68 @@
++package com.realtimechat.realtime;
++
++import static org.assertj.core.api.Assertions.assertThatCode;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.realtimechat.common.json.JsonUtil;
++import com.realtimechat.event.EventType;
++import com.realtimechat.event.StoredEvent;
++import com.realtimechat.event.payload.MessageSentPayload;
++import java.time.Instant;
++import java.util.UUID;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.data.redis.core.StringRedisTemplate;
++
++/**
++ * {@link RedisPubSubSessionBroadcaster} 단위 테스트(설계서 §5-A, BR-7, AC-14).
++ *
++ * <p>publish 실패 격리(BR-7)는 Spring 컨텍스트 없이 Mockito 단위 테스트로 검증한다.
++ * {@code StringRedisTemplate}를 전역 SpyBean으로 모킹하면 공유 통합 컨텍스트의 redis 연산이
++ * 깨지므로, 여기서는 plain mock으로 격리해 검증한다. {@code FanoutProps}는 실제 record를
++ * 생성해 {@code channelPrefix()}가 "chat.fanout."를 반환하도록 한다(생성자 바인딩 record).
++ */
++class RedisPubSubSessionBroadcasterTest {
++
++    /** EventBroadcast.from이 읽는 모든 필드를 채운 최소 StoredEvent. */
++    private static StoredEvent storedEvent() {
++        UUID sender = UUID.randomUUID();
++        JsonNode payload = JsonUtil.toJsonNode(
++                new MessageSentPayload(UUID.randomUUID(), sender, "br7-body"));
++        return new StoredEvent(
++                UUID.randomUUID(),       // eventId
++                UUID.randomUUID(),       // sessionId
++                1L,                      // seq
++                EventType.MESSAGE_SENT,  // type
++                payload,                 // payload
++                "br7-idem-key",          // idempotencyKey
++                sender,                  // actorId
++                Instant.now());          // occurredAt
++    }
++
++    // =====================================================================
++    // AC-14: convertAndSend가 예외를 던져도 broadcast는 예외를 전파하지 않는다(BR-7 swallow)
++    // =====================================================================
++    @Test
++    @DisplayName("AC-14: redis publish 실패(예외) 시 broadcast는 예외를 삼키고 전파하지 않음(BR-7)")
++    void ac14_broadcastSwallowsPublishFailure() {
++        StringRedisTemplate stringRedisTemplate = mock(StringRedisTemplate.class);
++        // mode=redis, channelPrefix는 실제 값("chat.fanout.")으로 바인딩.
++        FanoutProps fanoutProps = new FanoutProps("redis", "chat.fanout.");
++
++        // publish가 항상 실패하도록 설정(redis 장애 시뮬레이션).
++        doThrow(new RuntimeException("redis down"))
++                .when(stringRedisTemplate).convertAndSend(anyString(), anyString());
++
++        RedisPubSubSessionBroadcaster broadcaster =
++                new RedisPubSubSessionBroadcaster(stringRedisTemplate, fanoutProps);
++
++        StoredEvent event = storedEvent();
++
++        // BR-7: publish 실패는 진실의 원천을 오염시키지 않으므로 WARN 후 무시 → 호출자에게 예외 전파 없음.
++        assertThatCode(() -> broadcaster.broadcast(event.sessionId(), event))
++                .doesNotThrowAnyException();
++    }
++}
+diff --git a/src/test/resources/application-test.yml b/src/test/resources/application-test.yml
+index 7c42b70..db94ff9 100644
+--- a/src/test/resources/application-test.yml
++++ b/src/test/resources/application-test.yml
+@@ -1,3 +1,9 @@
++management:
++  prometheus:
++    metrics:
++      export:
++        enabled: true
++
+ spring:
+   # datasource는 Testcontainers @ServiceConnection이 동적으로 주입한다(고정 url 미지정).
+   flyway:
+@@ -14,6 +20,11 @@ logging:
+ # 테스트 튜닝: 비동기 파이프라인이 테스트 시간 내에 결정적으로 동작하도록 main의 chat.* 값을 오버라이드.
+ # (기존 39개 통합 테스트도 이 프로파일을 공유하나, 아래 값은 멱등·비치명적이라 무해하다.)
+ chat:
++  fanout:
++    mode: local                  # 테스트는 단일 인스턴스 local fanout으로 고정(Redis pub/sub 미사용).
++  presence:
++    ttl-seconds: 3               # presence TTL을 짧게(90→3)하여 만료/오프라인 전이를 테스트 시간 내 검증.
++    expiry-poll-ms: 500          # 만료 폴링 주기를 짧게(5000→500)하여 만료 감지 지연 단축.
+   outbox:
+     relay:
+       poll-interval-ms: 100      # relay 폴링을 빠르게(500→100): outbox→stream 발행 지연 단축(AC-3).
