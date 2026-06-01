@@ -26,6 +26,56 @@ services:
     volumes:
       - redis-data:/data
 
+  # 포트 오버라이드: 9090/3000 점유 시 PROMETHEUS_PORT/GRAFANA_PORT 환경변수로 변경 가능
+  # (예: PROMETHEUS_PORT=19090 GRAFANA_PORT=13000 docker compose up). 앱은 8080 고정.
+  # Prometheus/Grafana는 127.0.0.1 바인딩으로 로컬 노출만 허용(외부 인터페이스 미노출).
+
+  # 앱 — Prometheus가 컨테이너 DNS app:8080으로 스크랩. 전체 스택을 docker compose up 한 번으로 기동.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: realtime-chat-app
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/realtimechat
+      SPRING_DATASOURCE_USERNAME: realtimechat
+      SPRING_DATASOURCE_PASSWORD: realtimechat
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    # healthcheck 미정의(D-3): temurin:17-jre에 wget/curl 미보장. health 검증은 호스트 curl로.
+
+  # Prometheus — 9090. app 미기동에도 정상 기동(BR-4), 런타임 스크랩 재시도.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: realtime-chat-prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"   # 포트 점유 시 PROMETHEUS_PORT 환경변수로 오버라이드
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  # Grafana — 3000, 익명 Viewer 접근(BR-2). 프로비저닝으로 datasource/대시보드 자동 로드(stateless, D-6).
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: realtime-chat-grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"      # 포트 점유 시 GRAFANA_PORT 환경변수로 오버라이드
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
 volumes:
   postgres-data:
   redis-data:
