@@ -22,7 +22,7 @@
 ```
 
 - **Realtime Gateway**: WebSocket 연결, presence, 송수신 fan-out. **Phase 3 구현 완료** — Redis Pub/Sub fan-out 백플레인(`chat.fanout.{sessionId}`, `chat.fanout.mode` local/redis 스위치)으로 다중 인스턴스 전파, presence는 heartbeat ping + Redis 키 TTL(만료 sweep→OFFLINE 자동 전환).
-- **REST API**: 세션 생성/참여/종료, 이벤트 수집, 목록·타임라인 조회, **재연결 delta 조회**(`GET /sessions/{id}/events?afterSeq&limit`, raw 이벤트 + `hasMore`), heartbeat ping. **관측성**: Micrometer/Prometheus 메트릭 + Actuator(Phase 3).
+- **REST API**: 세션 생성/참여/종료, 이벤트 수집, 목록·타임라인 조회, **재연결 delta 조회**(`GET /sessions/{id}/events?afterSeq&limit`, raw 이벤트 + `hasMore`), heartbeat ping. **관측성**: Micrometer/Prometheus 메트릭 + Actuator(Phase 3), Prometheus 스크랩 + Grafana 대시보드 시각화(docker compose 통합 스택, BONUS-4).
 - **Event Store**: append-only 이벤트 저장. seq + idempotency key로 중복·순서 관리.
 - **Projection Worker**: 이벤트를 비동기로 읽어 읽기 모델/스냅샷 갱신. 재시도·DLQ·Idempotency 적용.
 
