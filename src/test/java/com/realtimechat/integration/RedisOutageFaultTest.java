@@ -46,11 +46,14 @@ class RedisOutageFaultTest extends AbstractFaultInjectionTest {
         // event store에 5건 모두 기록(유실 0).
         assertThat(eventStore.findBySeqRange(sessionId, 0L, Long.MAX_VALUE)).hasSize(total);
 
-        // then(감지): 차단 중에는 relay XADD가 실패하므로 outbox 미발행이 5건으로 적체되고(1초간 유지),
-        // 소비자가 stream을 읽지 못해 read model은 비어 있다 — 결정적.
-        await().during(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(2)).untilAsserted(() ->
-                assertThat(unpublishedOutboxCount(sessionId)).isEqualTo(total));
-        assertThat(messageViewDao.findRecent(sessionId, 50)).isEmpty();
+        // then(감지): 차단 중 relay XADD가 실패하므로 outbox 미발행 5건이 1초간 유지되고, 소비자가
+        // stream을 읽지 못해 read model도 비어 있다. 두 단언을 같은 during 블록에 묶어 "차단 구간 내내
+        // 미발행 적체 + read model 미반영"을 함께 보장한다. 부정 단언이라 상한 시간 내 미전진만 보장하나,
+        // Redis 차단 중에는 worker 소비가 원천 불가하므로 안전하다. atMost는 느린 CI 여유로 4초.
+        await().during(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(4)).untilAsserted(() -> {
+            assertThat(unpublishedOutboxCount(sessionId)).isEqualTo(total);
+            assertThat(messageViewDao.findRecent(sessionId, 50)).isEmpty();
+        });
 
         // when(복구): Redis 복구.
         healRedis();

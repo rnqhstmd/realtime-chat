@@ -42,7 +42,9 @@ dependencies {
 tasks.test {
     useJUnitPlatform()
     testLogging {
-        events("started", "passed", "failed", "skipped")
+        // 진단용: 실패/스킵만 로그로 남겨 노이즈를 줄이고, 실패 시 전체 스택으로 타이밍·예외 체인을
+        // 빠르게 파악한다(장애 주입 테스트 디버깅 가치 보존).
+        events("failed", "skipped")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
 }

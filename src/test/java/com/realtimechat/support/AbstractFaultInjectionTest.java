@@ -93,12 +93,13 @@ public abstract class AbstractFaultInjectionTest {
         // socketTimeout/connectTimeout(초)은 DB 차단(setConnectionCut) 시 hang을 막는 핵심이다.
         // Hikari connection-timeout은 '풀에서 새 커넥션을 빌리는' 대기만 제한하므로, 이미 풀에 있던
         // 커넥션으로 쿼리하다 소켓이 끊기면 PostgreSQL JDBC 기본 socketTimeout=0(무한)으로 영원히
-        // 블록된다. socketTimeout=2로 끊긴 커넥션의 쿼리를 2초 내 SQLException → DataAccessException으로
-        // 전환한다(차단 감지 결정성 확보).
+        // 블록된다. socketTimeout=5로 끊긴 커넥션의 쿼리를 5초 내 SQLException으로 전환한다. 5초는
+        // 차단 감지 결정성을 유지하면서, 느린 CI에서 Toxiproxy 경유 RTT가 더해져도 정상 쿼리를 잘못
+        // 끊지 않는 안전 마진이다(로컬 쿼리는 ms 단위라 영향 없음).
         registry.add("spring.datasource.url", () ->
                 "jdbc:postgresql://" + TOXIPROXY.getHost() + ":" + PG_PROXY.getProxyPort()
                         + "/" + POSTGRES.getDatabaseName()
-                        + "?socketTimeout=2&connectTimeout=2&loginTimeout=2");
+                        + "?socketTimeout=5&connectTimeout=5&loginTimeout=5");
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.data.redis.host", TOXIPROXY::getHost);
@@ -116,6 +117,10 @@ public abstract class AbstractFaultInjectionTest {
     /**
      * 각 테스트 종료 후 프록시 상태를 정상으로 되돌려 클래스 간 상태 누수를 막는다(공유 컨텍스트).
      * 컴포넌트 상태(worker stop 등)는 각 서브클래스의 {@code @AfterEach}가 복구한다.
+     *
+     * <p><b>주의</b>: 프록시 복구는 worker가 outage 중 stream에 쌓인 잔여 메시지를 드레인했음을
+     * 보장하지 않는다. fault 클래스가 같은 컨텍스트를 공유하므로 클래스 간 read-model 격리는 각
+     * 테스트가 <b>고유 sessionId</b>를 사용하는 것에 의존한다(전역 카운트 단언 금지).
      */
     @AfterEach
     void healAll() {
@@ -163,5 +168,13 @@ public abstract class AbstractFaultInjectionTest {
                 "SELECT coalesce(max(last_applied_seq), 0) FROM projection_offset WHERE session_id = ?",
                 Long.class, sessionId);
         return seq == null ? 0L : seq;
+    }
+
+    /** 세션에서 해당 idempotency key로 event 테이블에 저장된 행 수(부분 저장/멱등 흔적 검증용). */
+    protected int eventCountByIdempotencyKey(UUID sessionId, String idempotencyKey) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM event WHERE session_id = ? AND idempotency_key = ?",
+                Integer.class, sessionId, idempotencyKey);
+        return count == null ? 0 : count;
     }
 }

@@ -59,6 +59,8 @@ class DbOutageFaultTest extends AbstractFaultInjectionTest {
 
         // event store에 정확히 2건(before + after)만 존재 — 차단 중 부분 저장 없음.
         assertThat(eventStore.findBySeqRange(sessionId, 0L, Long.MAX_VALUE)).hasSize(2);
+        // 차단 중 실패한 시도("fi2-during")는 어떤 흔적도 남기지 않는다 — BR-1(event+outbox 원자성) 직접 증명.
+        assertThat(eventCountByIdempotencyKey(sessionId, "fi2-during")).isZero();
 
         // 복구 후 비동기 projection도 2건 정상 반영.
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->

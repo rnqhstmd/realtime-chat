@@ -57,9 +57,10 @@ class WorkerOutageFaultTest extends AbstractFaultInjectionTest {
             sendMessage(sessionId, sender, "during-outage-" + i, "fi1-during-" + i);
         }
 
-        // then(다운 중): worker가 멈췄으므로 1초가 지나도 read model은 따라잡지 못한다(여전히 1건).
-        // relay는 stream에 적재하지만 소비자가 없어 read model 미반영 — 결정적.
-        await().during(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(2)).untilAsserted(() ->
+        // then(다운 중): worker가 멈췄으므로 1초간 read model이 전진하지 않는다(여전히 1건). relay는
+        // stream에 적재하지만 소비자가 없어 미반영이다. 이 부정 단언은 "상한 시간 내 미전진"만 보장하며,
+        // worker 멈춤 자체는 위의 isRunning()==false로 직접 단언해 보완한다. atMost는 느린 CI 여유로 4초.
+        await().during(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(4)).untilAsserted(() ->
                 assertThat(messageViewDao.findRecent(sessionId, 50)).hasSize(1));
 
         // when(복구): 인스턴스 재기동.
@@ -67,6 +68,8 @@ class WorkerOutageFaultTest extends AbstractFaultInjectionTest {
         assertThat(projectionWorker.isRunning()).isTrue();
 
         // then(복구): 다운 중 수집분(5건) + 기존(1건) = 6건이 누락 없이 반영되고 offset이 전진한다.
+        // 미전달 메시지는 신규 XREADGROUP `>`로, stop이 소비 도중 끊었다면 재청구(XPENDING/XCLAIM)
+        // 경로로 처리되며, 최종 단언은 두 경로의 합집합이다(유실 0).
         long expected = 1L + during;
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             assertThat(messageViewDao.findRecent(sessionId, 50)).hasSize((int) expected);
