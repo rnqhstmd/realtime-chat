@@ -1,0 +1,18 @@
+# 장애 주입 테스트(test + fault 프로파일) 전용 설정.
+#
+# DB/Redis를 Toxiproxy로 차단했을 때 빠르게 실패하도록 타임아웃을 단축한다(운영 application.yml 무영향).
+# datasource.url / spring.data.redis.host·port 는 AbstractFaultInjectionTest 의
+# @DynamicPropertySource 가 Toxiproxy 프록시 주소로 주입한다(여기서 지정하지 않는다).
+#
+# chat.* 비동기 파이프라인 튜닝(relay poll-interval, claim-min-idle 등)은 application-test.yml 을
+# 그대로 상속한다(test 프로파일 동시 활성).
+spring:
+  datasource:
+    hikari:
+      connection-timeout: 2000      # DB 차단 시 ~2초 내 실패(기본 30s). 차단 테스트 지연 방지.
+      validation-timeout: 1000
+      keepalive-time: 0
+  data:
+    redis:
+      timeout: 1000                 # Lettuce command timeout: 차단 시 worker/relay 가 1초 내 실패 → 백오프.
+      connect-timeout: 1000

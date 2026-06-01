@@ -29,3 +29,5 @@
 | heartbeat | 클라이언트가 연결 생존을 알리려 주기적으로 보내는 경량 ping(기본 30s). **이벤트가 아니며** event store/outbox/stream/팬아웃을 거치지 않고 Redis presence 키 TTL만 갱신한다(Phase 3). 이벤트화하면 last_seq 폭증·resume delta 오염이 생기므로 분리 |
 | presence TTL / liveness | Redis 키 `presence:{sessionId}:{participantId}`의 TTL(기본 90s)로 참여자 생존을 추적. heartbeat가 TTL을 갱신하고, 미수신으로 키가 만료되면 만료 감지 sweep(5s 폴링)이 OFFLINE 전이를 자동 발행한다. OFFLINE 중복은 tracked Set의 SREM 원자 반환값으로 정확히 1회 보장(read model 무관) |
 | 관측성 메트릭 | Micrometer Gauge(projection lag)/Counter(DLQ·stream·outbox 처리량)를 `/actuator/prometheus`로 노출. Actuator `/health`(Redis·DB)·`/info`와 MDC(sessionId/seq/eventType) 구조화 로그 포함(Phase 3) |
+| Fault Injection (장애 주입) | 실제 인프라 장애를 의도적으로 주입해 복구 메커니즘을 실증하는 테스트. 과제 §4.4-(3) 3종을 다룬다 — 서버 다운(`ProjectionWorker` stop/start), DB 장애(Toxiproxy로 PG 차단), 데이터 정합성(Redis 차단 중 outbox 적체→복구 후 재발행). 최종 단언은 항상 "read model이 event store와 일치"(유실 0). 설계: `docs/design/2026-06-01-fault-injection-tests-design.md` |
+| Toxiproxy | DB/Redis 앞단에 두는 네트워크 프록시 컨테이너. `setConnectionCut(true/false)`로 연결을 즉시 차단·복구해 실제 네트워크 단절을 재현한다. 포트가 고정되어 Spring 데이터소스/Redis 설정이 안정적이고, 연결 거부가 즉시 발생해 테스트가 결정적. 차단 시 JDBC `socketTimeout`을 설정해야 끊긴 소켓 read의 무한 hang을 막는다 |
