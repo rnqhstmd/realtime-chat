@@ -1,6 +1,12 @@
 # OMC tooling state
 .omc/
 
+# gx-dev pipeline artifacts
+.dev/
+
+# k6 load-test raw outputs (결과는 docs/load-test/*.md로 관리)
+load-test/k6/results/
+
 # Gradle / Spring Boot build artifacts
 .gradle/
 build/

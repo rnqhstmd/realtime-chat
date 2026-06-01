@@ -56,7 +56,7 @@
 |----|------|------|---------|
 | BONUS-1 | Snapshot 생성 자동화 | ✅ | [#3](https://github.com/rnqhstmd/realtime-chat/pull/3) |
 | BONUS-2 | Projection 비동기 파이프라인 구성 | ✅ | [#3](https://github.com/rnqhstmd/realtime-chat/pull/3) |
-| BONUS-3 | 부하 테스트 및 성능 측정 결과 | ⬜ | |
+| BONUS-3 | 부하 테스트 및 성능 측정 결과 | ✅ | [#6](https://github.com/rnqhstmd/realtime-chat/pull/6) k6 4시나리오(append/restore/query/resume) 측정, 에러율 0% |
 | BONUS-4 | 운영 대시보드 또는 메트릭 시각화 | ⬜ | |
 | BONUS-5 | WebRTC 등 추가 통신 방식 비교/구현 | ⬜ | |
 | BONUS-6 | 테스트 전략 고도화(통합/장애주입/재현 스크립트) | ✅ | Toxiproxy 장애 주입 3종(서버다운/DB/Redis), 80 tests 0 fail |
