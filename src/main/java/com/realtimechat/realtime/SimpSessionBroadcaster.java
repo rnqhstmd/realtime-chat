@@ -2,6 +2,7 @@ package com.realtimechat.realtime;
 
 import com.realtimechat.event.StoredEvent;
 import java.util.UUID;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Component;
 
@@ -17,8 +18,14 @@ import org.springframework.stereotype.Component;
  * 이 경로 하나로만 일어나 중복 전달을 방지한다(설계서 §6).
  *
  * <p>다중 인스턴스 팬아웃(Redis Pub/Sub backplane)은 Phase 3 확장 항목이다(설계서 §7).
+ *
+ * <p>Phase 3 모드 스위치(설계서 §2-A, §5-A): {@code chat.fanout.mode=local}(기본,
+ * {@code matchIfMissing})일 때만 이 빈이 등록되어 직접 STOMP 전달을 수행한다.
+ * {@code redis} 모드에서는 {@link RedisPubSubSessionBroadcaster}가 대신 등록되어
+ * publish만 수행한다(이중 전달 금지 불변식). 한 시점에 한 구현체만 등록되어 주입 모호성이 없다.
  */
 @Component
+@ConditionalOnProperty(name = "chat.fanout.mode", havingValue = "local", matchIfMissing = true)
 public class SimpSessionBroadcaster implements SessionBroadcaster {
 
     /** 구독 토픽 prefix. {@code WebSocketConfig}의 SimpleBroker prefix(/topic)와 일관(설계서 §6). */

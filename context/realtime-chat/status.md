@@ -28,9 +28,9 @@
 | FR-9 | 핵심 테이블 DDL 일부 | ⬜ | |
 | FR-10 | 핫패스 중심 인덱스 설계 근거 | ⬜ | |
 | FR-11 | REST API 스펙(OpenAPI 권장) | ⬜ | |
-| FR-12 | 재연결 시 데이터 정합성 유지 방식 | ⬜ | |
-| FR-13 | 수평 확장 시 세션 분산·상태 저장 전략 | ⬜ | |
-| FR-14 | 관측 가능성 설계(로그/메트릭/추적) | ⬜ | |
+| FR-12 | 재연결 시 데이터 정합성 유지 방식 | ✅ | [#4](https://github.com/rnqhstmd/realtime-chat/pull/4) |
+| FR-13 | 수평 확장 시 세션 분산·상태 저장 전략 | ✅ | [#4](https://github.com/rnqhstmd/realtime-chat/pull/4) |
+| FR-14 | 관측 가능성 설계(로그/메트릭/추적) | ✅ | [#4](https://github.com/rnqhstmd/realtime-chat/pull/4) |
 | FR-15 | 비동기 처리 구조(Projection/Snapshot/재시도/DLQ/Idempotency) | ✅ | [#3](https://github.com/rnqhstmd/realtime-chat/pull/3) |
 | FR-16 | 장애 대응 시나리오(서버다운/DB장애/데이터유실) | ⬜ | |
 

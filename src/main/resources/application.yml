@@ -24,8 +24,19 @@ logging:
   level:
     root: INFO
     com.realtimechat: DEBUG
+  # 구조화 로그(FR-P3-6, [Could]): Spring Boot 기본 콘솔 패턴에 MDC 필드만 덧붙임.
+  # MDC 없는 로그(예: 부팅·스케줄러)에서는 default(:-)로 빈 값 표시되어 가독성 유지.
+  pattern:
+    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} [sid=%X{sessionId:-} seq=%X{seq:-} type=%X{eventType:-}] %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n${LOG_EXCEPTION_CONVERSION_WORD:-%wEx}"
 
 chat:
+  fanout:
+    mode: local                 # local | redis. 기본 local(단일 인스턴스).
+    channel-prefix: "chat.fanout."
+  presence:
+    ttl-seconds: 90
+    heartbeat-interval-seconds: 30
+    expiry-poll-ms: 5000
   outbox:
     relay:
       poll-interval-ms: 500
@@ -44,3 +55,12 @@ chat:
     read-block-ms: 2000
     read-count: 50
     stream-maxlen: 100000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: always

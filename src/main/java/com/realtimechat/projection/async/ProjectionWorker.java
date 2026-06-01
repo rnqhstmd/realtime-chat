@@ -197,6 +197,8 @@ public class ProjectionWorker implements SmartLifecycle {
 
         // apply TX 커밋 성공 후에만 XACK.
         redisTemplate.opsForStream().acknowledge(props.stream(), props.group(), record.getId());
+        // 스트림에서 소비·ACK한 메시지 1건 처리 완료(처리량 관측, FR-P3-4). DLQ 경로는 별도 카운터.
+        lagMetrics.recordStreamProcessed();
     }
 
     /**

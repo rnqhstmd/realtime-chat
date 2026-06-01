@@ -26,3 +26,6 @@
 | Consumer Group | Redis Stream의 소비자 그룹(`proj`). 메시지를 그룹 내 소비자에게 한 번씩 분배하고 미ACK 메시지를 PEL(pending)로 추적. projection worker가 XREADGROUP으로 소비 |
 | DLQ (Dead Letter Queue) | 재시도 한도(기본 3회)를 초과한 독성 메시지를 격리하는 별도 스트림(`events:dlq`). 본 파이프라인 정체를 막고, event store가 원천이라 수동 재처리 가능 |
 | gap-fill | projection worker가 수신 seq가 `last_applied_seq+1`보다 큰 gap을 감지하면, event store(`findBySeqRange`)에서 누락 구간을 직접 조회해 순서대로 보강 적용하는 것. 순서·완전성의 권위는 스트림이 아닌 event store |
+| heartbeat | 클라이언트가 연결 생존을 알리려 주기적으로 보내는 경량 ping(기본 30s). **이벤트가 아니며** event store/outbox/stream/팬아웃을 거치지 않고 Redis presence 키 TTL만 갱신한다(Phase 3). 이벤트화하면 last_seq 폭증·resume delta 오염이 생기므로 분리 |
+| presence TTL / liveness | Redis 키 `presence:{sessionId}:{participantId}`의 TTL(기본 90s)로 참여자 생존을 추적. heartbeat가 TTL을 갱신하고, 미수신으로 키가 만료되면 만료 감지 sweep(5s 폴링)이 OFFLINE 전이를 자동 발행한다. OFFLINE 중복은 tracked Set의 SREM 원자 반환값으로 정확히 1회 보장(read model 무관) |
+| 관측성 메트릭 | Micrometer Gauge(projection lag)/Counter(DLQ·stream·outbox 처리량)를 `/actuator/prometheus`로 노출. Actuator `/health`(Redis·DB)·`/info`와 MDC(sessionId/seq/eventType) 구조화 로그 포함(Phase 3) |

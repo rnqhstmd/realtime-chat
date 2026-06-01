@@ -14,6 +14,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
  * 전역 예외 → HTTP 응답 매핑.
@@ -47,6 +48,15 @@ public class ApiExceptionHandler {
     @ExceptionHandler(MissingRequestHeaderException.class)
     public ResponseEntity<Map<String, Object>> handleMissingHeader(MissingRequestHeaderException e) {
         return build(HttpStatus.BAD_REQUEST, "Missing required header: " + e.getHeaderName());
+    }
+
+    /**
+     * 요청 파라미터 타입 불일치(예: {@code limit}에 숫자가 아닌 값) → 400. 클라이언트 요청 결함이므로
+     * 400으로 매핑한다. 미처리 시 catch-all로 500이 되어 클라이언트 오류가 서버 오류로 잘못 표기되는 것을 방지한다.
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<Map<String, Object>> handleTypeMismatch(MethodArgumentTypeMismatchException e) {
+        return build(HttpStatus.BAD_REQUEST, "Invalid parameter '" + e.getName() + "': " + e.getValue());
     }
 
     @ExceptionHandler(SessionNotFoundException.class)

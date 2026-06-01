@@ -3,6 +3,7 @@ package com.realtimechat.outbox;
 import com.realtimechat.async.EventStreamCodec;
 import com.realtimechat.async.StreamProps;
 import com.realtimechat.event.StoredEvent;
+import com.realtimechat.projection.async.ProjectionLagMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -35,6 +36,7 @@ public class OutboxRelay {
     private final EventStreamCodec codec;
     private final StreamProps props;
     private final StringRedisTemplate stringRedisTemplate;
+    private final ProjectionLagMetrics metrics;
 
     @Value("${chat.outbox.relay.batch-size:100}")
     private int batchSize;
@@ -42,11 +44,13 @@ public class OutboxRelay {
     public OutboxRelay(OutboxDao outboxDao,
                        EventStreamCodec codec,
                        StreamProps props,
-                       StringRedisTemplate stringRedisTemplate) {
+                       StringRedisTemplate stringRedisTemplate,
+                       ProjectionLagMetrics metrics) {
         this.outboxDao = outboxDao;
         this.codec = codec;
         this.props = props;
         this.stringRedisTemplate = stringRedisTemplate;
+        this.metrics = metrics;
     }
 
     /**
@@ -80,6 +84,8 @@ public class OutboxRelay {
 
         if (!successIds.isEmpty()) {
             outboxDao.markPublished(successIds);
+            // 발행 성공 레코드 수만큼 처리량 카운트(FR-P3-4). 0건이면 호출 생략.
+            metrics.recordOutboxRelayed(successIds.size());
         }
 
         try {

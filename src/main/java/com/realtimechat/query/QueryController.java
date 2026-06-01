@@ -1,6 +1,7 @@
 package com.realtimechat.query;
 
 import com.realtimechat.common.error.InvalidEventException;
+import com.realtimechat.common.web.LimitSupport;
 import com.realtimechat.projection.MessageViewDao;
 import com.realtimechat.restore.RestoreService;
 import com.realtimechat.restore.SessionState;
@@ -33,9 +34,6 @@ import org.springframework.web.bind.annotation.RestController;
 public class QueryController {
 
     private static final int DEFAULT_LIVE_MESSAGES = 50;
-
-    /** limit 파라미터 상한(RISK 보강). 과도한 N으로 인한 메모리/응답 비대화를 막는다. */
-    private static final int MAX_LIMIT = 500;
 
     private final RestoreService restoreService;
     private final SnapshotService snapshotService;
@@ -72,7 +70,7 @@ public class QueryController {
             @RequestParam(name = "at", required = false) String at,
             @RequestParam(name = "limit", required = false) Integer limit) {
         SessionState state = restore(id, at);
-        int recent = limit != null ? validateLimit(limit) : timelineRecentMessages;
+        int recent = limit != null ? LimitSupport.validate(limit) : timelineRecentMessages;
         return TimelineResponse.from(state, recent);
     }
 
@@ -86,7 +84,7 @@ public class QueryController {
     public List<MessageDto> messages(
             @PathVariable UUID id,
             @RequestParam(name = "limit", required = false, defaultValue = "" + DEFAULT_LIVE_MESSAGES) int limit) {
-        return messageViewDao.findRecent(id, validateLimit(limit)).stream()
+        return messageViewDao.findRecent(id, LimitSupport.validate(limit)).stream()
                 .map(MessageDto::from)
                 .toList();
     }
@@ -130,18 +128,6 @@ public class QueryController {
             throw new InvalidEventException(
                     "Invalid 'at': expected seq (integer) or ISO-8601 timestamp, got: " + at, e);
         }
-    }
-
-    /**
-     * limit 범위 검증(1~{@value #MAX_LIMIT}). 범위 밖이면 {@link InvalidEventException}(400).
-     * 미지정 기본값은 호출부에서 결정하므로 여기서는 명시된 값만 검증한다.
-     */
-    private static int validateLimit(int limit) {
-        if (limit < 1 || limit > MAX_LIMIT) {
-            throw new InvalidEventException(
-                    "Invalid 'limit': must be between 1 and " + MAX_LIMIT + ", got: " + limit);
-        }
-        return limit;
     }
 
     /** {@code at}이 순수 정수(seq)인지 판별한다. 음수·소수·문자 혼합은 timestamp 경로로 보낸다. */
