@@ -46,6 +46,6 @@ export default function (data) {
   appendLatency.add(res.timings.duration);
   check(res, {
     'append 200': (r) => r.status === 200,
-    'append has eventId': (r) => !!r.json('eventId'),
+    'append has eventId': (r) => r.status === 200 && !!r.json('eventId'),
   });
 }

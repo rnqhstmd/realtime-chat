@@ -59,6 +59,6 @@ export default function (data) {
   queryLatency.add(res.timings.duration);
   check(res, {
     'messages 200': (r) => r.status === 200,
-    'messages is array': (r) => Array.isArray(r.json()),
+    'messages is array': (r) => r.status === 200 && Array.isArray(r.json()),
   });
 }

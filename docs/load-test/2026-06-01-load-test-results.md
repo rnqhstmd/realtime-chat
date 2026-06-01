@@ -97,7 +97,7 @@ k6로 측정한다. 각 시나리오의 부하 규모(VU/ramp/지속)는 고정�
 
 ## 4. Projection lag (AC-5)
 
-append 시나리오 종료 직후 `/actuator/prometheus`를 스크랩하여 `chat.projection.lag.millis{state=...}`
+append 시나리오 종료 직후 `/actuator/prometheus`를 스크랩하여 `chat_projection_lag_millis{state=...}`
 값을 기록한다.
 
 ```bash

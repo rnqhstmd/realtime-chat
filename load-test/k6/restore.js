@@ -15,7 +15,7 @@
 //   docker run --rm -i -e BASE_URL=http://host.docker.internal:8081 \
 //     -v "$(pwd)/load-test/k6:/scripts" grafana/k6 run /scripts/restore.js
 import http from 'k6/http';
-import { check, group } from 'k6';
+import { check, group, fail } from 'k6';
 import { Trend } from 'k6/metrics';
 import {
   BASE_URL,
@@ -65,7 +65,10 @@ export function setup() {
   seedMessages(snapId, snapActor, SNAPSHOT_EVENTS);
   // 명시적 스냅샷 보장(POST /snapshots → 202). 자동 스냅샷(비동기)에 의존하지 않는다.
   const snapRes = http.post(`${BASE_URL}/sessions/${snapId}/snapshots`, null);
-  check(snapRes, { 'snapshot 202': (r) => r.status === 202 });
+  // 스냅샷 생성 실패 시 "스냅샷 有" 케이스가 실제로는 전체 replay를 측정하게 되어 신뢰성이 떨어지므로 명시적 중단.
+  if (!check(snapRes, { 'snapshot 202': (r) => r.status === 202 })) {
+    fail(`snapshot 생성 실패(status=${snapRes.status}): "스냅샷 有" 케이스 측정 신뢰성 확보를 위해 중단한다.`);
+  }
 
   return { noSnapId, snapId };
 }

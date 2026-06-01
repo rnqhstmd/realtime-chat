@@ -57,6 +57,6 @@ export default function (data) {
   resumeLatency.add(res.timings.duration);
   check(res, {
     'events 200': (r) => r.status === 200,
-    'events has list': (r) => Array.isArray(r.json('events')),
+    'events has list': (r) => r.status === 200 && Array.isArray(r.json('events')),
   });
 }

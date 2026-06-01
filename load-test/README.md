@@ -36,8 +36,9 @@ TPS·latency를 **재현 가능한 방식(k6)**으로 측정한다.
 
 ## 실행 — docker (k6 로컬 미설치 환경, 권장)
 
-k6를 로컬에 설치하지 않고 `grafana/k6` 이미지로 실행한다. Docker Desktop은
-`host.docker.internal`을 기본 제공하므로 `--add-host`는 불필요하다. 컨테이너에서 host 앱은
+k6를 로컬에 설치하지 않고 `grafana/k6` 이미지로 실행한다. Docker Desktop(Windows/macOS)은
+`host.docker.internal`을 기본 제공한다. **Linux Docker Engine**에서는 기본 제공되지 않으므로
+docker run에 `--add-host=host.docker.internal:host-gateway`를 추가한다. 컨테이너에서 host 앱은
 `host.docker.internal:8081`로 접근한다(`-e BASE_URL`로 주입).
 
 프로젝트 루트에서 실행한다.
@@ -93,7 +94,7 @@ k6 run -e BASE_URL=http://localhost:9090 append.js
 ## 실행 순서 (권장)
 
 1. `append.js` — 핫패스 append TPS 측정. 직후 `/actuator/prometheus`에서
-   projection lag(`chat.projection.lag.millis{state="max"}`)을 스크랩하여 결과 문서에 기록.
+   projection lag(`chat_projection_lag_millis{state="max"}`)을 스크랩하여 결과 문서에 기록.
 2. `query.js` — 라이브 조회 latency.
 3. `restore.js` — 복원 latency(스냅샷 無/有). setup 단계에서 스냅샷 有 세션에 1,200건 적재 +
    명시적 `POST /snapshots` 호출에 시간이 걸리므로 setup 타임아웃을 600s로 둔다.

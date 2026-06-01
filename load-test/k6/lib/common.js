@@ -111,15 +111,36 @@ export function appendMessage(sessionId, actorId, content) {
 }
 
 /**
- * 세션에 메시지를 N건 사전 적재한다(setup 단계 전용). 적재 진행 상황을 로그로 남긴다.
- * restore/query/resume 시나리오의 사전 데이터 구성에 사용한다.
+ * 세션에 메시지를 N건 사전 적재한다(setup 단계 전용).
+ * http.batch로 100건씩 묶어 병렬 전송하여 대량 적재 시간을 단축한다(순차 적재는 setupTimeout 초과 위험).
+ * restore/query/resume 시나리오의 사전 데이터 구성에 사용한다. 각 요청은 고유 멱등키를 사용한다.
+ * @returns 200 응답을 받은 건수(성공 적재 수).
  */
 export function seedMessages(sessionId, actorId, count) {
+  const batchSize = 100;
   let ok = 0;
-  for (let i = 0; i < count; i++) {
-    const res = appendMessage(sessionId, actorId, `seed-${i}`);
-    if (res.status === 200) {
-      ok++;
+  for (let i = 0; i < count; i += batchSize) {
+    const n = Math.min(batchSize, count - i);
+    const requests = [];
+    for (let j = 0; j < n; j++) {
+      const idx = i + j;
+      const body = JSON.stringify({
+        type: 'MESSAGE_SENT',
+        payload: { content: `seed-${idx}`, senderId: actorId },
+        actorId: actorId,
+      });
+      requests.push({
+        method: 'POST',
+        url: `${BASE_URL}/sessions/${sessionId}/events`,
+        body: body,
+        params: { headers: jsonHeaders(uniqueIdempotencyKey(`seed-${idx}`)) },
+      });
+    }
+    const responses = http.batch(requests);
+    for (const res of responses) {
+      if (res.status === 200) {
+        ok++;
+      }
     }
   }
   return ok;
