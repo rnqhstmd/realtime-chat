@@ -35,9 +35,14 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:postgresql")
     testImplementation("com.redis:testcontainers-redis:2.2.2")
+    testImplementation("org.testcontainers:toxiproxy")
     testImplementation("org.awaitility:awaitility")
 }
 
 tasks.test {
     useJUnitPlatform()
+    testLogging {
+        events("started", "passed", "failed", "skipped")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
