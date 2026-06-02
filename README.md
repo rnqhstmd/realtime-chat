@@ -10,6 +10,8 @@
 
 ## 실행
 
+아래 "실행"은 **호스트 개발용**(인프라만 컨테이너 + 앱은 `bootRun`)이다. 앱까지 컨테이너로 전체 스택을 한 번에 기동하려면 [모니터링 스택](#모니터링-스택)을 참조한다.
+
 ```bash
 # 1. 인프라 기동 (PostgreSQL)
 docker-compose up -d
@@ -22,6 +24,38 @@ docker-compose up -d
 - DB 접속: `jdbc:postgresql://localhost:5432/realtimechat` (user/pw: `realtimechat`)
 
 > 설계 근거는 `.dev/feat-realtime-chat/design.md` 참조.
+
+## 모니터링 스택
+
+앱·PostgreSQL·Redis·Prometheus·Grafana 전체를 컨테이너로 한 번에 기동한다(앱은 멀티스테이지 `Dockerfile`로 빌드된다).
+
+```bash
+# 전체 스택 기동 (앱 컨테이너 포함). 최초 1회는 앱 이미지 빌드로 수 분 소요될 수 있다.
+docker compose up --build
+```
+
+기동 후:
+
+- **Grafana**: `http://localhost:3000` — 로그인 불필요(익명 Viewer). 대시보드 **"Realtime Chat — Operations"**가 자동 로드된다(프로비저닝). 패널:
+  - Projection Lag (last / max): 투영 지연(ms). 각각 5000ms / 10000ms 수평 임계선 표시.
+  - Stream Processed / Outbox Relayed: 스트림 처리·아웃박스 릴레이 처리량(`rate(...[1m])`).
+  - DLQ Failures: DLQ 적재 실패 누적(0=정상 green, 1 이상 red).
+  - HTTP Request Rate: 엔드포인트별 요청률.
+  - JVM Heap Used: 힙 메모리 사용량.
+- **Prometheus**: `http://localhost:9090` — 타깃 상태는 `http://localhost:9090/targets`에서 `realtime-chat-app`(app:8080) 확인. 15초 간격으로 `/actuator/prometheus` 스크랩.
+- **앱 헬스 확인**: `curl http://localhost:8080/actuator/health` → `{"status":"UP"}`.
+
+> 앱 컨테이너는 헬스체크를 정의하지 않으므로(런타임 이미지에 wget/curl 미보장) Prometheus/Grafana는 앱 기동 여부와 무관하게 항상 뜬다. 앱이 늦게 뜨면 Prometheus 타깃이 잠시 DOWN으로 표시되다가 자동 복구된다.
+
+> 앱 healthcheck가 없어 스택 기동 직후 Prometheus 첫 스크랩까지 시차가 있다. `docker compose up` 후 약 15~30초 대기한 뒤 Grafana에 접속하면 패널에 데이터가 채워진다.
+
+### 포트 오버라이드
+
+`9090`/`3000`이 점유되어 있으면 환경변수로 변경한다(앱 포트 `8080`은 고정).
+
+```bash
+PROMETHEUS_PORT=19090 GRAFANA_PORT=13000 docker compose up --build
+```
 
 ## Phase 1 보안 가정 및 비범위
 

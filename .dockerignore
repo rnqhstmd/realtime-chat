@@ -1,0 +1,20 @@
+build/
+.gradle/
+.git/
+.dev/
+.omc/
+monitoring/
+docs/
+load-test/
+context/
+requirements/
+*.md
+.idea/
+*.iml
+.vscode/
+# 민감 파일
+.env*
+*.key
+*.pem
+*.p12
+*.jks

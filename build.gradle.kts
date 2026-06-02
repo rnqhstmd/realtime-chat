@@ -48,3 +48,8 @@ tasks.test {
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
 }
+
+// Spring Boot bootJar만 산출하도록 plain jar 비활성화 → 컨테이너 COPY 시 단일 산출물 보장(D-4).
+tasks.named<Jar>("jar") {
+    enabled = false
+}
